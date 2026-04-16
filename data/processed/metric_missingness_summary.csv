@@ -1,0 +1,5 @@
+Metrics,total_obs,non_missing_obs,missing_obs,missing_pct
+Analyst Selectivity Ratio,8492,8120,372,4.38
+Language Complexity,8492,8117,375,4.42
+Net Positivity,8492,8117,375,4.42
+Numeric Transeprency,8492,8117,375,4.42
