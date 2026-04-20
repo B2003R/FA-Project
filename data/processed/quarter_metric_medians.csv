@@ -1,0 +1,177 @@
+quarter,Metrics,median_value
+CQ12014,Analyst Selectivity Ratio,41.28
+CQ12014,Language Complexity,12.305
+CQ12014,Net Positivity,0.97
+CQ12014,Numeric Transeprency,2.7199999999999998
+CQ12015,Analyst Selectivity Ratio,42.21
+CQ12015,Language Complexity,12.35
+CQ12015,Net Positivity,1.0150000000000001
+CQ12015,Numeric Transeprency,2.8449999999999998
+CQ12016,Analyst Selectivity Ratio,41.67
+CQ12016,Language Complexity,12.45
+CQ12016,Net Positivity,0.88
+CQ12016,Numeric Transeprency,2.77
+CQ12017,Analyst Selectivity Ratio,42.86
+CQ12017,Language Complexity,12.39
+CQ12017,Net Positivity,1.07
+CQ12017,Numeric Transeprency,2.67
+CQ12018,Analyst Selectivity Ratio,40.0
+CQ12018,Language Complexity,12.455
+CQ12018,Net Positivity,1.24
+CQ12018,Numeric Transeprency,2.755
+CQ12019,Analyst Selectivity Ratio,42.86
+CQ12019,Language Complexity,12.49
+CQ12019,Net Positivity,1.13
+CQ12019,Numeric Transeprency,2.7
+CQ12020,Analyst Selectivity Ratio,40.0
+CQ12020,Language Complexity,12.385000000000002
+CQ12020,Net Positivity,1.13
+CQ12020,Numeric Transeprency,2.6900000000000004
+CQ12021,Analyst Selectivity Ratio,41.425
+CQ12021,Language Complexity,12.434999999999999
+CQ12021,Net Positivity,1.19
+CQ12021,Numeric Transeprency,2.39
+CQ12022,Analyst Selectivity Ratio,38.46
+CQ12022,Language Complexity,12.489999999999998
+CQ12022,Net Positivity,1.26
+CQ12022,Numeric Transeprency,2.535
+CQ12023,Analyst Selectivity Ratio,38.46
+CQ12023,Language Complexity,12.415
+CQ12023,Net Positivity,1.125
+CQ12023,Numeric Transeprency,2.505
+CQ12024,Analyst Selectivity Ratio,36.36
+CQ12024,Language Complexity,12.52
+CQ12024,Net Positivity,1.28
+CQ12024,Numeric Transeprency,2.58
+CQ22014,Analyst Selectivity Ratio,39.13
+CQ22014,Language Complexity,12.13
+CQ22014,Net Positivity,0.96
+CQ22014,Numeric Transeprency,2.23
+CQ22015,Analyst Selectivity Ratio,42.11
+CQ22015,Language Complexity,12.29
+CQ22015,Net Positivity,0.98
+CQ22015,Numeric Transeprency,2.17
+CQ22016,Analyst Selectivity Ratio,42.86
+CQ22016,Language Complexity,12.24
+CQ22016,Net Positivity,0.99
+CQ22016,Numeric Transeprency,2.15
+CQ22017,Analyst Selectivity Ratio,41.18
+CQ22017,Language Complexity,12.28
+CQ22017,Net Positivity,1.09
+CQ22017,Numeric Transeprency,2.25
+CQ22018,Analyst Selectivity Ratio,42.86
+CQ22018,Language Complexity,12.379999999999999
+CQ22018,Net Positivity,1.205
+CQ22018,Numeric Transeprency,2.0949999999999998
+CQ22019,Analyst Selectivity Ratio,42.265
+CQ22019,Language Complexity,12.475000000000001
+CQ22019,Net Positivity,1.0750000000000002
+CQ22019,Numeric Transeprency,2.14
+CQ22020,Analyst Selectivity Ratio,40.74
+CQ22020,Language Complexity,12.7
+CQ22020,Net Positivity,0.27
+CQ22020,Numeric Transeprency,1.71
+CQ22021,Analyst Selectivity Ratio,40.74
+CQ22021,Language Complexity,12.295
+CQ22021,Net Positivity,1.295
+CQ22021,Numeric Transeprency,2.01
+CQ22022,Analyst Selectivity Ratio,40.0
+CQ22022,Language Complexity,12.31
+CQ22022,Net Positivity,1.0150000000000001
+CQ22022,Numeric Transeprency,2.09
+CQ22023,Analyst Selectivity Ratio,37.5
+CQ22023,Language Complexity,12.35
+CQ22023,Net Positivity,1.185
+CQ22023,Numeric Transeprency,2.0549999999999997
+CQ22024,Analyst Selectivity Ratio,35.5
+CQ22024,Language Complexity,12.325
+CQ22024,Net Positivity,1.3450000000000002
+CQ22024,Numeric Transeprency,1.975
+CQ32014,Analyst Selectivity Ratio,40.0
+CQ32014,Language Complexity,12.33
+CQ32014,Net Positivity,1.03
+CQ32014,Numeric Transeprency,2.29
+CQ32015,Analyst Selectivity Ratio,43.33
+CQ32015,Language Complexity,12.18
+CQ32015,Net Positivity,1.03
+CQ32015,Numeric Transeprency,2.23
+CQ32016,Analyst Selectivity Ratio,42.86
+CQ32016,Language Complexity,12.274999999999999
+CQ32016,Net Positivity,0.96
+CQ32016,Numeric Transeprency,2.24
+CQ32017,Analyst Selectivity Ratio,42.86
+CQ32017,Language Complexity,12.26
+CQ32017,Net Positivity,1.17
+CQ32017,Numeric Transeprency,2.22
+CQ32018,Analyst Selectivity Ratio,43.405
+CQ32018,Language Complexity,12.355
+CQ32018,Net Positivity,1.25
+CQ32018,Numeric Transeprency,2.21
+CQ32019,Analyst Selectivity Ratio,42.11
+CQ32019,Language Complexity,12.39
+CQ32019,Net Positivity,1.16
+CQ32019,Numeric Transeprency,2.13
+CQ32020,Analyst Selectivity Ratio,41.18
+CQ32020,Language Complexity,12.51
+CQ32020,Net Positivity,0.88
+CQ32020,Numeric Transeprency,1.8450000000000002
+CQ32021,Analyst Selectivity Ratio,37.8
+CQ32021,Language Complexity,12.379999999999999
+CQ32021,Net Positivity,1.35
+CQ32021,Numeric Transeprency,2.0999999999999996
+CQ32022,Analyst Selectivity Ratio,38.89
+CQ32022,Language Complexity,12.25
+CQ32022,Net Positivity,0.99
+CQ32022,Numeric Transeprency,2.07
+CQ32023,Analyst Selectivity Ratio,37.5
+CQ32023,Language Complexity,12.274999999999999
+CQ32023,Net Positivity,1.23
+CQ32023,Numeric Transeprency,2.1500000000000004
+CQ32024,Analyst Selectivity Ratio,38.89
+CQ32024,Language Complexity,12.36
+CQ32024,Net Positivity,1.3
+CQ32024,Numeric Transeprency,1.99
+CQ42014,Analyst Selectivity Ratio,40.64
+CQ42014,Language Complexity,12.235
+CQ42014,Net Positivity,1.005
+CQ42014,Numeric Transeprency,2.425
+CQ42015,Analyst Selectivity Ratio,42.485
+CQ42015,Language Complexity,12.335
+CQ42015,Net Positivity,0.96
+CQ42015,Numeric Transeprency,2.365
+CQ42016,Analyst Selectivity Ratio,41.18
+CQ42016,Language Complexity,12.21
+CQ42016,Net Positivity,0.975
+CQ42016,Numeric Transeprency,2.32
+CQ42017,Analyst Selectivity Ratio,40.0
+CQ42017,Language Complexity,12.41
+CQ42017,Net Positivity,1.1
+CQ42017,Numeric Transeprency,2.27
+CQ42018,Analyst Selectivity Ratio,42.31
+CQ42018,Language Complexity,12.425
+CQ42018,Net Positivity,1.18
+CQ42018,Numeric Transeprency,2.245
+CQ42019,Analyst Selectivity Ratio,42.31
+CQ42019,Language Complexity,12.35
+CQ42019,Net Positivity,1.09
+CQ42019,Numeric Transeprency,2.25
+CQ42020,Analyst Selectivity Ratio,43.305
+CQ42020,Language Complexity,12.36
+CQ42020,Net Positivity,1.01
+CQ42020,Numeric Transeprency,1.9649999999999999
+CQ42021,Analyst Selectivity Ratio,40.0
+CQ42021,Language Complexity,12.41
+CQ42021,Net Positivity,1.13
+CQ42021,Numeric Transeprency,2.12
+CQ42022,Analyst Selectivity Ratio,38.46
+CQ42022,Language Complexity,12.344999999999999
+CQ42022,Net Positivity,1.02
+CQ42022,Numeric Transeprency,2.105
+CQ42023,Analyst Selectivity Ratio,37.5
+CQ42023,Language Complexity,12.434999999999999
+CQ42023,Net Positivity,1.2
+CQ42023,Numeric Transeprency,2.22
+CQ42024,Analyst Selectivity Ratio,36.36
+CQ42024,Language Complexity,12.46
+CQ42024,Net Positivity,1.3
+CQ42024,Numeric Transeprency,2.11
