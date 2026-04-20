@@ -7,23 +7,23 @@ def answer_query(query, latest_snapshot, high_risk, high_credibility, signal_scr
     if not q:
         return "Please type a question."
 
-    # ------------------------------------------
+  
     # Top risky companies
-    # ------------------------------------------
+    
     if "top risky" in q or "high risk" in q:
         top = high_risk.head(5)[["ticker", "risk_score", "ret_20d", "credibility_score"]]
         return "Top high-risk companies:\n\n" + top.to_string(index=False)
 
-    # ------------------------------------------
+   
     # Top credibility companies
-    # ------------------------------------------
+  
     if "high credibility" in q or "top credibility" in q:
         top = high_credibility.head(5)[["ticker", "credibility_score", "ret_20d", "risk_score"]]
         return "Top high-credibility companies:\n\n" + top.to_string(index=False)
 
-    # ------------------------------------------
+    
     # Compare two companies
-    # ------------------------------------------
+  
     if "compare" in q:
         tickers = [t for t in latest_snapshot["ticker"].dropna().unique() if t.lower() in q]
         if len(tickers) >= 2:
@@ -44,9 +44,8 @@ def answer_query(query, latest_snapshot, high_risk, high_credibility, signal_scr
 
         return "I could not identify two valid tickers to compare."
 
-    # ------------------------------------------
     # Summarize one company
-    # ------------------------------------------
+  
     possible_tickers = [t for t in latest_snapshot["ticker"].dropna().unique() if t.lower() in q]
 
     if possible_tickers:
@@ -80,10 +79,8 @@ def answer_query(query, latest_snapshot, high_risk, high_credibility, signal_scr
             lines.append(f"- Numeric transparency: {latest['numeric_transparency']:.4f}")
 
         return "\n".join(lines)
-
-    # ------------------------------------------
+ 
     # Fallback
-    # ------------------------------------------
     return (
         "I can help with:\n"
         "- show top risky companies\n"

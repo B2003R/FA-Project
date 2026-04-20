@@ -5,19 +5,14 @@ import plotly.express as px
 from insight_engine import generate_company_insight
 from copilot_engine import answer_query
 
-# --------------------------------------------------
 # App setup
-# --------------------------------------------------
 st.set_page_config(
     page_title="AI Finance Copilot Dashboard",
     layout="wide"
 )
 
 st.title("AI Finance Copilot Dashboard")
-
-# --------------------------------------------------
 # Paths
-# --------------------------------------------------
 ROOT = Path(__file__).resolve().parent.parent
 PROCESSED = ROOT / "data" / "processed"
 
@@ -27,9 +22,7 @@ cred_path = PROCESSED / "high_credibility_companies.parquet"
 screen_path = PROCESSED / "signal_screener.parquet"
 master_features_path = PROCESSED / "master_panel_features.parquet"
 
-# --------------------------------------------------
 # Load data
-# --------------------------------------------------
 latest_snapshot = pd.read_parquet(latest_path)
 high_risk = pd.read_parquet(risk_path)
 high_credibility = pd.read_parquet(cred_path)
@@ -41,16 +34,13 @@ for df in [latest_snapshot, high_risk, high_credibility, signal_screener, master
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
 
-# --------------------------------------------------
 # Sidebar navigation
-# --------------------------------------------------
 page = st.sidebar.radio(
     "Select Page",
     ["Overview", "Company Explorer", "Signal Screener", "Compare Companies", "Copilot"]
 )
-# --------------------------------------------------
+
 # OVERVIEW PAGE
-# --------------------------------------------------
 if page == "Overview":
 
     st.header("Market Overview")
@@ -109,9 +99,7 @@ if page == "Overview":
         use_container_width=True
     )
 
-# --------------------------------------------------
 # COMPANY EXPLORER PAGE
-# --------------------------------------------------
 elif page == "Company Explorer":
     st.header("Company Explorer")
 
@@ -128,9 +116,7 @@ elif page == "Company Explorer":
     else:
         latest_row = latest_row.iloc[0]
 
-        # --------------------------------------------------
         # Top metrics
-        # --------------------------------------------------
         col1, col2, col3, col4 = st.columns(4)
 
         col1.metric("Latest Close", round(float(latest_row["dlyclose"]), 2))
@@ -144,9 +130,7 @@ elif page == "Company Explorer":
 
         st.divider()
 
-        # --------------------------------------------------
         # Simple company insight summary
-        # --------------------------------------------------
         st.subheader("Company Insight Summary")
 
         insight_lines = []
@@ -184,16 +168,12 @@ elif page == "Company Explorer":
             st.write(line)
 
         st.divider()
-        # --------------------------------------------------
         # AI Insight
-        # --------------------------------------------------
         st.subheader("AI Insight")
         insight_text = generate_company_insight(company_df)
         st.info(insight_text)
         st.divider()
-        # --------------------------------------------------
         # Latest row table
-        # --------------------------------------------------
         st.subheader("Latest Snapshot")
         snapshot_cols = [
             "ticker",
@@ -217,9 +197,7 @@ elif page == "Company Explorer":
 
         st.divider()
 
-        # --------------------------------------------------
         # Price Trend
-        # --------------------------------------------------
         st.subheader("Price Trend")
         fig_price = px.line(
             company_df,
@@ -229,9 +207,7 @@ elif page == "Company Explorer":
         )
         st.plotly_chart(fig_price, use_container_width=True)
 
-        # --------------------------------------------------
         # Transcript Metrics Over Time
-        # --------------------------------------------------
         st.subheader("Transcript Metrics Over Time")
         metric_cols = [
             "net_positivity",
@@ -251,9 +227,7 @@ elif page == "Company Explorer":
             )
             st.plotly_chart(fig_metrics, use_container_width=True)
 
-        # --------------------------------------------------
         # Dashboard Scores Over Time
-        # --------------------------------------------------
         st.subheader("Dashboard Scores Over Time")
         score_cols = ["credibility_score", "risk_score", "misalignment_score"]
         available_scores = [c for c in score_cols if c in company_df.columns]
@@ -267,9 +241,9 @@ elif page == "Company Explorer":
             )
             st.plotly_chart(fig_scores, use_container_width=True)
 
-# --------------------------------------------------
+
 # SIGNAL SCREENER PAGE
-# --------------------------------------------------
+
 elif page == "Signal Screener":
     st.header("Signal Screener")
 
@@ -380,9 +354,9 @@ elif page == "Signal Screener":
         mime="text/csv"
     )
 
-# --------------------------------------------------
+
 # COMPARE COMPANIES PAGE
-# --------------------------------------------------
+
 elif page == "Compare Companies":
     st.header("Compare Companies")
 
