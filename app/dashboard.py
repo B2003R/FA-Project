@@ -12,22 +12,45 @@ st.set_page_config(
 )
 
 st.title("AI Finance Copilot Dashboard")
+
 # Paths
 ROOT = Path(__file__).resolve().parent.parent
 PROCESSED = ROOT / "data" / "processed"
 
+# Existing parquet paths
 latest_path = PROCESSED / "latest_company_snapshot.parquet"
 risk_path = PROCESSED / "high_risk_companies.parquet"
 cred_path = PROCESSED / "high_credibility_companies.parquet"
 screen_path = PROCESSED / "signal_screener.parquet"
 master_features_path = PROCESSED / "master_panel_features.parquet"
 
-# Load data
-latest_snapshot = pd.read_parquet(latest_path)
-high_risk = pd.read_parquet(risk_path)
-high_credibility = pd.read_parquet(cred_path)
-signal_screener = pd.read_parquet(screen_path)
-master_features = pd.read_parquet(master_features_path)
+# New CSV paths
+latest_csv_path = PROCESSED / "latest_company_snapshot.csv"
+metric_summary_csv_path = PROCESSED / "metric_summary_dashboard.csv"
+high_risk_csv_path = PROCESSED / "high_risk_companies.csv"
+
+
+@st.cache_data
+def load_parquet(path):
+    return pd.read_parquet(path)
+
+
+@st.cache_data
+def load_csv(path):
+    return pd.read_csv(path)
+
+
+# Load existing parquet data
+latest_snapshot = load_parquet(latest_path)
+high_risk = load_parquet(risk_path)
+high_credibility = load_parquet(cred_path)
+signal_screener = load_parquet(screen_path)
+master_features = load_parquet(master_features_path)
+
+# Load new summary CSVs if available
+latest_company_snapshot_csv = load_csv(latest_csv_path) if latest_csv_path.exists() else None
+metric_summary_dashboard = load_csv(metric_summary_csv_path) if metric_summary_csv_path.exists() else None
+high_risk_companies_csv = load_csv(high_risk_csv_path) if high_risk_csv_path.exists() else None
 
 # Basic cleaning
 for df in [latest_snapshot, high_risk, high_credibility, signal_screener, master_features]:
@@ -37,7 +60,14 @@ for df in [latest_snapshot, high_risk, high_credibility, signal_screener, master
 # Sidebar navigation
 page = st.sidebar.radio(
     "Select Page",
-    ["Overview", "Company Explorer", "Signal Screener", "Compare Companies", "Copilot"]
+    [
+        "Overview",
+        "Company Explorer",
+        "Signal Screener",
+        "Compare Companies",
+        "Summary Tables",
+        "Copilot"
+    ]
 )
 
 # OVERVIEW PAGE
@@ -47,25 +77,10 @@ if page == "Overview":
 
     col1, col2, col3, col4 = st.columns(4)
 
-    col1.metric(
-        "Total Companies",
-        latest_snapshot["ticker"].nunique()
-    )
-
-    col2.metric(
-        "Average Risk Score",
-        round(latest_snapshot["risk_score"].mean(), 3)
-    )
-
-    col3.metric(
-        "Average Credibility",
-        round(latest_snapshot["credibility_score"].mean(), 3)
-    )
-
-    col4.metric(
-        "Avg 20d Return",
-        round(latest_snapshot["ret_20d"].mean(), 4)
-    )
+    col1.metric("Total Companies", latest_snapshot["ticker"].nunique())
+    col2.metric("Average Risk Score", round(latest_snapshot["risk_score"].mean(), 3))
+    col3.metric("Average Credibility", round(latest_snapshot["credibility_score"].mean(), 3))
+    col4.metric("Avg 20d Return", round(latest_snapshot["ret_20d"].mean(), 4))
 
     st.divider()
 
@@ -84,23 +99,17 @@ if page == "Overview":
     st.divider()
 
     st.subheader("Top 10 High Risk Companies")
-
-    st.dataframe(
-        high_risk.head(10),
-        use_container_width=True
-    )
+    st.dataframe(high_risk.head(10), use_container_width=True)
 
     st.divider()
 
     st.subheader("Top 10 High Credibility Companies")
+    st.dataframe(high_credibility.head(10), use_container_width=True)
 
-    st.dataframe(
-        high_credibility.head(10),
-        use_container_width=True
-    )
 
 # COMPANY EXPLORER PAGE
 elif page == "Company Explorer":
+
     st.header("Company Explorer")
 
     tickers = sorted(master_features["ticker"].dropna().unique())
@@ -116,7 +125,6 @@ elif page == "Company Explorer":
     else:
         latest_row = latest_row.iloc[0]
 
-        # Top metrics
         col1, col2, col3, col4 = st.columns(4)
 
         col1.metric("Latest Close", round(float(latest_row["dlyclose"]), 2))
@@ -130,7 +138,6 @@ elif page == "Company Explorer":
 
         st.divider()
 
-        # Simple company insight summary
         st.subheader("Company Insight Summary")
 
         insight_lines = []
@@ -168,13 +175,15 @@ elif page == "Company Explorer":
             st.write(line)
 
         st.divider()
-        # AI Insight
+
         st.subheader("AI Insight")
         insight_text = generate_company_insight(company_df)
         st.info(insight_text)
+
         st.divider()
-        # Latest row table
+
         st.subheader("Latest Snapshot")
+
         snapshot_cols = [
             "ticker",
             "date",
@@ -192,43 +201,48 @@ elif page == "Company Explorer":
             "risk_score",
             "misalignment_score",
         ]
+
         snapshot_cols = [c for c in snapshot_cols if c in company_df.columns]
         st.dataframe(company_df[snapshot_cols].tail(1), use_container_width=True)
 
         st.divider()
 
-        # Price Trend
         st.subheader("Price Trend")
+
         fig_price = px.line(
             company_df,
             x="date",
             y="dlyclose",
             title=f"{selected_ticker} Closing Price"
         )
+
         st.plotly_chart(fig_price, use_container_width=True)
 
-        # Transcript Metrics Over Time
         st.subheader("Transcript Metrics Over Time")
+
         metric_cols = [
             "net_positivity",
             "numeric_transparency",
             "language_complexity",
             "analyst_selectivity_ratio"
         ]
+
         available_metrics = [c for c in metric_cols if c in company_df.columns]
 
         if available_metrics:
             metric_plot_df = company_df[["date"] + available_metrics].copy()
+
             fig_metrics = px.line(
                 metric_plot_df,
                 x="date",
                 y=available_metrics,
                 title=f"{selected_ticker} Transcript Metrics"
             )
+
             st.plotly_chart(fig_metrics, use_container_width=True)
 
-        # Dashboard Scores Over Time
         st.subheader("Dashboard Scores Over Time")
+
         score_cols = ["credibility_score", "risk_score", "misalignment_score"]
         available_scores = [c for c in score_cols if c in company_df.columns]
 
@@ -239,12 +253,13 @@ elif page == "Company Explorer":
                 y=available_scores,
                 title=f"{selected_ticker} Scores"
             )
+
             st.plotly_chart(fig_scores, use_container_width=True)
 
 
 # SIGNAL SCREENER PAGE
-
 elif page == "Signal Screener":
+
     st.header("Signal Screener")
 
     screener_df = signal_screener.copy()
@@ -318,6 +333,7 @@ elif page == "Signal Screener":
     st.write(f"Rows shown: {len(filtered)}")
 
     m1, m2, m3 = st.columns(3)
+
     m1.metric("Average Risk", round(filtered["risk_score"].mean(), 4) if len(filtered) else 0)
     m2.metric("Average Credibility", round(filtered["credibility_score"].mean(), 4) if len(filtered) else 0)
     m3.metric("Average 20d Return", round(filtered["ret_20d"].mean(), 4) if len(filtered) else 0)
@@ -337,6 +353,7 @@ elif page == "Signal Screener":
             size="relative_volume" if "relative_volume" in plot_df.columns else None,
             title="Filtered Companies: Risk vs Credibility"
         )
+
         st.plotly_chart(fig_screen, use_container_width=True)
     else:
         st.info("No companies available for the chart with the current filters.")
@@ -347,6 +364,7 @@ elif page == "Signal Screener":
     st.dataframe(filtered, use_container_width=True)
 
     csv_data = filtered.to_csv(index=False).encode("utf-8")
+
     st.download_button(
         label="Download filtered results as CSV",
         data=csv_data,
@@ -356,8 +374,8 @@ elif page == "Signal Screener":
 
 
 # COMPARE COMPANIES PAGE
-
 elif page == "Compare Companies":
+
     st.header("Compare Companies")
 
     tickers = sorted(master_features["ticker"].dropna().unique())
@@ -381,49 +399,31 @@ elif page == "Compare Companies":
 
     c1, c2 = st.columns(2)
 
+    compare_cols = [
+        "ticker",
+        "date",
+        "dlyclose",
+        "ret_20d",
+        "vol_20d",
+        "net_positivity",
+        "numeric_transparency",
+        "language_complexity",
+        "credibility_score",
+        "risk_score",
+        "misalignment_score",
+    ]
+
     with c1:
         st.markdown(f"### {ticker_1}")
         if not latest_1.empty:
-            st.dataframe(
-                latest_1[
-                    [
-                        "ticker",
-                        "date",
-                        "dlyclose",
-                        "ret_20d",
-                        "vol_20d",
-                        "net_positivity",
-                        "numeric_transparency",
-                        "language_complexity",
-                        "credibility_score",
-                        "risk_score",
-                        "misalignment_score",
-                    ]
-                ],
-                use_container_width=True
-            )
+            cols_1 = [c for c in compare_cols if c in latest_1.columns]
+            st.dataframe(latest_1[cols_1], use_container_width=True)
 
     with c2:
         st.markdown(f"### {ticker_2}")
         if not latest_2.empty:
-            st.dataframe(
-                latest_2[
-                    [
-                        "ticker",
-                        "date",
-                        "dlyclose",
-                        "ret_20d",
-                        "vol_20d",
-                        "net_positivity",
-                        "numeric_transparency",
-                        "language_complexity",
-                        "credibility_score",
-                        "risk_score",
-                        "misalignment_score",
-                    ]
-                ],
-                use_container_width=True
-            )
+            cols_2 = [c for c in compare_cols if c in latest_2.columns]
+            st.dataframe(latest_2[cols_2], use_container_width=True)
 
     st.divider()
 
@@ -441,6 +441,7 @@ elif page == "Compare Companies":
         color="ticker",
         title=f"{ticker_1} vs {ticker_2} Closing Price"
     )
+
     st.plotly_chart(fig_price_compare, use_container_width=True)
 
     st.divider()
@@ -469,6 +470,7 @@ elif page == "Compare Companies":
         color="ticker",
         title=f"{ticker_1} vs {ticker_2}: {metric_choice}"
     )
+
     st.plotly_chart(fig_metric_compare, use_container_width=True)
 
     st.divider()
@@ -492,12 +494,41 @@ elif page == "Compare Companies":
         color="ticker",
         title=f"{ticker_1} vs {ticker_2}: {score_choice}"
     )
+
     st.plotly_chart(fig_score_compare, use_container_width=True)
 
-# --------------------------------------------------
+
+# SUMMARY TABLES PAGE
+elif page == "Summary Tables":
+
+    st.header("Summary Tables from CRSP + Transcript Merge")
+
+    if latest_company_snapshot_csv is not None:
+        st.subheader("Latest Company Snapshot")
+        st.dataframe(latest_company_snapshot_csv, use_container_width=True)
+    else:
+        st.warning("latest_company_snapshot.csv not found.")
+
+    st.divider()
+
+    if metric_summary_dashboard is not None:
+        st.subheader("Metric Summary Dashboard")
+        st.dataframe(metric_summary_dashboard, use_container_width=True)
+    else:
+        st.warning("metric_summary_dashboard.csv not found.")
+
+    st.divider()
+
+    if high_risk_companies_csv is not None:
+        st.subheader("High-Risk Companies from New Pipeline")
+        st.dataframe(high_risk_companies_csv, use_container_width=True)
+    else:
+        st.warning("high_risk_companies.csv not found.")
+
+
 # COPILOT PAGE
-# --------------------------------------------------
 elif page == "Copilot":
+
     st.header("Finance Copilot")
 
     st.write("Ask things like:")
