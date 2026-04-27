@@ -29,6 +29,11 @@ latest_csv_path = PROCESSED / "latest_company_snapshot.csv"
 metric_summary_csv_path = PROCESSED / "metric_summary_dashboard.csv"
 high_risk_csv_path = PROCESSED / "high_risk_companies.csv"
 
+# Prediction CSV paths
+baseline_predictions_path = PROCESSED / "baseline_predictions.csv"
+feature_importance_path = PROCESSED / "feature_importance.csv"
+top_prediction_errors_path = PROCESSED / "top_prediction_errors.csv"
+
 
 @st.cache_data
 def load_parquet(path):
@@ -52,6 +57,11 @@ latest_company_snapshot_csv = load_csv(latest_csv_path) if latest_csv_path.exist
 metric_summary_dashboard = load_csv(metric_summary_csv_path) if metric_summary_csv_path.exists() else None
 high_risk_companies_csv = load_csv(high_risk_csv_path) if high_risk_csv_path.exists() else None
 
+# Load prediction CSVs if available
+baseline_predictions = load_csv(baseline_predictions_path) if baseline_predictions_path.exists() else None
+feature_importance = load_csv(feature_importance_path) if feature_importance_path.exists() else None
+top_prediction_errors = load_csv(top_prediction_errors_path) if top_prediction_errors_path.exists() else None
+
 # Basic cleaning
 for df in [latest_snapshot, high_risk, high_credibility, signal_screener, master_features]:
     if "date" in df.columns:
@@ -66,6 +76,7 @@ page = st.sidebar.radio(
         "Signal Screener",
         "Compare Companies",
         "Summary Tables",
+        "Prediction Intelligence",
         "Copilot"
     ]
 )
@@ -524,6 +535,73 @@ elif page == "Summary Tables":
         st.dataframe(high_risk_companies_csv, use_container_width=True)
     else:
         st.warning("high_risk_companies.csv not found.")
+
+
+# PREDICTION INTELLIGENCE PAGE
+elif page == "Prediction Intelligence":
+
+    st.header("Prediction Intelligence")
+
+    if baseline_predictions is None:
+        st.warning("baseline_predictions.csv not found. Run modeling_baseline.ipynb first.")
+    else:
+        st.subheader("Prediction Results")
+
+        mae = baseline_predictions["error"].abs().mean()
+        rmse = (baseline_predictions["error"] ** 2).mean() ** 0.5
+
+        c1, c2, c3 = st.columns(3)
+
+        c1.metric("MAE", round(mae, 4))
+        c2.metric("RMSE", round(rmse, 4))
+        c3.metric("Prediction Rows", len(baseline_predictions))
+
+        st.dataframe(baseline_predictions.head(50), use_container_width=True)
+
+        st.divider()
+
+        st.subheader("Actual vs Predicted")
+
+        plot_df = baseline_predictions.dropna(
+            subset=["target_next_q", "prediction_next_q"]
+        ).copy()
+
+        fig_pred = px.scatter(
+            plot_df,
+            x="target_next_q",
+            y="prediction_next_q",
+            color="Metrics",
+            hover_name="Symbol",
+            title="Actual vs Predicted Next-Quarter Transcript Value"
+        )
+
+        st.plotly_chart(fig_pred, use_container_width=True)
+
+    st.divider()
+
+    if feature_importance is not None:
+        st.subheader("Feature Importance")
+
+        fig_importance = px.bar(
+            feature_importance,
+            x="Importance",
+            y="Feature",
+            orientation="h",
+            title="Random Forest Feature Importance"
+        )
+
+        st.plotly_chart(fig_importance, use_container_width=True)
+        st.dataframe(feature_importance, use_container_width=True)
+    else:
+        st.warning("feature_importance.csv not found.")
+
+    st.divider()
+
+    if top_prediction_errors is not None:
+        st.subheader("Top Prediction Errors")
+        st.dataframe(top_prediction_errors, use_container_width=True)
+    else:
+        st.warning("top_prediction_errors.csv not found.")
 
 
 # COPILOT PAGE
