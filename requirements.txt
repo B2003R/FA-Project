@@ -1,0 +1,25 @@
+# Core data stack
+pandas>=2.0
+numpy>=1.24
+
+# Machine-learning models
+# XGBoost 2.x ships CUDA wheels for Windows via pip; no separate CUDA install required.
+# GPU: uses tree_method='hist', device='cuda' (auto-selected by GPU probe cell).
+xgboost>=2.0
+
+# LightGBM: standard pip wheel is CPU-only on Windows.
+# For GPU support use conda-forge:
+#   conda install -c conda-forge lightgbm
+# or build from source with CUDA (see https://lightgbm.readthedocs.io/en/stable/GPU-Tutorial.html).
+# The GPU probe cell in Final_code.ipynb detects GPU availability automatically
+# and falls back to CPU if the GPU build is not present.
+lightgbm>=4.0
+
+# sklearn (RandomForest — CPU only)
+scikit-learn>=1.3
+
+# Plotting
+matplotlib>=3.7
+
+# Scipy (Spearman IC in evaluate())
+scipy>=1.10

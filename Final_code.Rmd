@@ -1,0 +1,1579 @@
+---
+title: "Final project notebook: earnings calls and CRSP daily returns"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+options(scipen = 999)
+set.seed(42)
+```
+
+```{r libraries}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(tibble)
+library(stringr)
+library(lubridate)
+library(zoo)
+library(slider)
+library(ggplot2)
+library(reshape2)
+library(lightgbm)
+library(xgboost)
+```
+
+This notebook builds a **daily security–date panel**: CRSP daily fields merged with **prior-quarter** transcript-based metrics, then models **next-day `dlyretx`** (with `next_day_return` from `dlyret` kept for diagnostics) using **LightGBM**, **XGBoost**, optional **Random Forest**, and **walk-forward time-series CV** for hyperparameter tuning.
+
+## How to run
+
+Run chunks **top to bottom** in order. The first code chunk loads R packages; paths point to `Data/Raw Data/` under this project (adjust if your layout differs). Later sections mirror the Python notebook’s **GPU** notes where relevant; this R port runs **LightGBM / XGBoost on CPU** by default.
+
+## Main outputs
+
+- Cleaned transcript universe aligned with CRSP tickers
+- `merged_daily_df` / `model_df` with transcript **missingness flags**, **z-scored** transcript metrics and dynamics (train-fitted scaler), **`dlyret` / `dlyretx` lags**, rolling stats, **OHLC microstructure**, optional **cross-sectional** features, **`FE_STAGE`** ablation switch, and encoded categoricals (`ticker_enc`, `siccd_enc`, `naics_enc`)
+- Time-based train / validation / test split and model comparison metrics
+
+## 1. Data loading
+
+- Load CRSP daily (`crsp_v2_2014_2024.csv`) and the wide transcript metrics file.
+- Use `glimpse()` to confirm dtypes, row counts, and column names before cleaning.
+
+
+```{r cell_load_csvs}
+# --- Load raw CRSP and transcript CSVs; print schema ---
+crsp_df <- read_csv(
+  "H:/My Drive/Project/FA Project/Data/Raw Data/crsp_v2_2014_2024.csv",
+  show_col_types = FALSE
+)
+transcripts_df <- read_csv(
+  "H:/My Drive/Project/FA Project/Data/Raw Data/Transcripts Machine Readable Data.csv",
+  show_col_types = FALSE
+)
+glimpse(crsp_df)
+glimpse(transcripts_df)
+```
+
+## 2. Ticker coverage (transcripts vs CRSP)
+
+Identify symbols that appear in **transcripts** but not in **CRSP**, and decide how to restrict the transcript universe so merges are reliable.
+
+
+### Tickers in transcripts missing from CRSP
+
+List symbols present in the transcript file but **not** in CRSP `ticker`, before we restrict the transcript universe.
+
+```{r cell_ticker_compare}
+# --- Compare unique tickers: transcripts vs CRSP ---
+crsp_tickers <- unique(crsp_df$ticker)
+transcripts_tickers <- unique(transcripts_df$Symbol)
+cat(length(unique(transcripts_df$Symbol)), "---", length(unique(crsp_df$ticker)), "\n")
+for (ticker in transcripts_tickers) {
+  if (!ticker %in% crsp_tickers) {
+    co_name <- unique(transcripts_df$`Company Name`[transcripts_df$Symbol == ticker])
+    cat(ticker, paste0("['", paste(co_name, collapse = "', '"), "']"), "\n")
+  }
+}
+```
+
+### Tickers dropped from transcripts
+
+The previous chunk lists companies present in **transcripts** but not in **CRSP** (e.g. alternate share classes). Those tickers are removed from the transcript table so later merges use a consistent symbol set.
+
+## 3. Exploratory missingness
+
+Quick **null counts** on the raw CRSP and transcript tables after the initial universe decision.
+
+
+```{r cell_crsp_nulls}
+# --- CRSP: null counts per column ---
+colSums(is.na(crsp_df))
+```
+
+```{r cell_transcripts_nulls}
+# --- Transcripts: null counts per column ---
+colSums(is.na(transcripts_df))
+```
+
+## 4. Transcript filtering and quarterly missingness
+
+Keep transcript rows in the CRSP ticker set, analyze **quarterly (CQ*)** missing values by ticker, optionally drop the worst tickers, and summarize missing rates.
+
+
+```{r cell_filter_transcripts}
+# 1) Filter transcript rows for symbols absent from CRSP
+crsp_tickers_set <- unique(na.omit(crsp_df$ticker))
+transcript_tickers_set <- unique(na.omit(transcripts_df$Symbol))
+missing_symbols <- sort(setdiff(transcript_tickers_set, crsp_tickers_set))
+
+cat("Symbols in transcripts but not in CRSP:", paste0("['", paste(missing_symbols, collapse = "', '"), "']"), "\n")
+cat("Count:", length(missing_symbols), "\n")
+
+transcripts_filtered_df <- transcripts_df %>%
+  filter(!Symbol %in% missing_symbols)
+
+# Drop unnamed columns if present
+unnamed_cols <- grep("^Unnamed", colnames(transcripts_filtered_df), value = TRUE)
+if (length(unnamed_cols) > 0) {
+  transcripts_filtered_df <- transcripts_filtered_df %>% select(-all_of(unnamed_cols))
+}
+
+cat("Unique symbols before:", length(unique(transcripts_df$Symbol)), "\n")
+cat("Unique symbols after:", length(unique(transcripts_filtered_df$Symbol)), "\n")
+cat("Rows before:", nrow(transcripts_df), "| Rows after:", nrow(transcripts_filtered_df), "\n")
+```
+
+```{r cell_ohlc_missing}
+# 2) Identify which tickers have missing values in OHLC columns
+ohlc_cols <- c("dlyclose", "dlyhigh", "dlyopen", "dlylow")
+missing_ohlc_mask <- rowSums(is.na(crsp_df[, ohlc_cols])) > 0
+
+missing_ohlc_ticker_counts <- sort(table(crsp_df$ticker[missing_ohlc_mask]), decreasing = TRUE)
+cat("Ticker-level missing OHLC counts:\n")
+print(missing_ohlc_ticker_counts)
+
+missing_ohlc_details <- crsp_df[missing_ohlc_mask, c("permno", "ticker", "dlycaldt", ohlc_cols)] %>%
+  arrange(ticker, dlycaldt)
+
+cat("\nSample missing OHLC rows:\n")
+print(head(missing_ohlc_details, 20))
+```
+
+```{r cell_missing_per_quarter_plot}
+# 3) Plot missing count by quarter in transcripts (filtered universe)
+quarter_cols <- grep("^CQ[1-4]\\d{4}$", colnames(transcripts_filtered_df), value = TRUE)
+
+quarter_sort_key <- function(col_name) {
+  q <- as.integer(substr(col_name, 3, 3))
+  y <- as.integer(substr(col_name, 4, nchar(col_name)))
+  y * 10 + q
+}
+quarter_cols <- quarter_cols[order(sapply(quarter_cols, quarter_sort_key))]
+missing_per_quarter <- colSums(is.na(transcripts_filtered_df[, quarter_cols]))
+
+missing_per_quarter_df <- tibble(
+  quarter = factor(quarter_cols, levels = quarter_cols),
+  missing_count = as.integer(missing_per_quarter)
+)
+
+ggplot(missing_per_quarter_df, aes(x = quarter, y = missing_count)) +
+  geom_col(fill = "steelblue") +
+  labs(title = "Missing Transcript Count by Quarter (Filtered Symbols)",
+       x = "Quarter", y = "Missing count") +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))
+```
+
+```{r cell_ticker_missing_summary}
+# 4) Ticker with highest transcript missing values vs total quarterly cells
+symbol_rows <- transcripts_filtered_df %>%
+  group_by(Symbol) %>%
+  summarise(n_rows = n(), .groups = "drop")
+
+missing_cells_df <- transcripts_filtered_df %>%
+  group_by(Symbol) %>%
+  summarise(missing_cells = sum(is.na(across(all_of(quarter_cols)))), .groups = "drop")
+
+ticker_missing_summary <- symbol_rows %>%
+  inner_join(missing_cells_df, by = "Symbol") %>%
+  mutate(
+    total_quarterly_cells = n_rows * length(quarter_cols),
+    missing_rate = missing_cells / total_quarterly_cells
+  ) %>%
+  arrange(desc(missing_cells))
+
+cat("Top 10 tickers by missing quarterly transcript values:\n")
+print(head(ticker_missing_summary, 20))
+
+ggplot(ticker_missing_summary, aes(x = seq_along(missing_rate), y = missing_rate)) +
+  geom_line() +
+  labs(x = "ticker rank", y = "missing_rate")
+```
+
+### Tickers with heavy quarterly missingness
+
+Some tickers had **entirely** or **mostly** missing `CQ*` transcript fields. The following chunks **drop rows** for the top four tickers by missing quarterly cells, then re-check missing counts.
+
+```{r cell_drop_top4}
+# 5) Remove rows for the top 4 tickers with the most missing quarterly transcript values
+top4_missing_tickers <- head(ticker_missing_summary$Symbol, 4)
+cat("Dropping rows for top 4 missing tickers:", paste0("['", paste(top4_missing_tickers, collapse = "', '"), "']"), "\n")
+
+rows_before <- nrow(transcripts_filtered_df)
+syms_before <- length(unique(transcripts_filtered_df$Symbol))
+
+transcripts_filtered_df <- transcripts_filtered_df %>%
+  filter(!Symbol %in% top4_missing_tickers)
+
+cat("Rows before drop:", rows_before, "| after:", nrow(transcripts_filtered_df), "\n")
+cat("Unique symbols before/after:", syms_before, "|", length(unique(transcripts_filtered_df$Symbol)), "\n")
+```
+
+```{r cell_new_missing_per_quarter}
+# 6) New missing values after deleting top 4 missing tickers
+new_missing_per_quarter <- colSums(is.na(transcripts_filtered_df[, quarter_cols]))
+cat("New missing values per quarter after deletion:\n")
+print(new_missing_per_quarter)
+cat("\nTotal missing quarterly values after deletion:", sum(new_missing_per_quarter), "\n")
+
+new_missing_df <- tibble(
+  quarter = factor(quarter_cols, levels = quarter_cols),
+  missing_count = as.integer(new_missing_per_quarter)
+)
+
+ggplot(new_missing_df, aes(x = quarter, y = missing_count)) +
+  geom_col(fill = "steelblue") +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))
+```
+
+### After dropping high-missing transcript rows
+
+Quarterly missing counts and a bar chart summarize remaining gaps after removing the worst tickers by missing `CQ*` cells.
+
+```{r cell_quarter_missing_rate}
+# 7) Average and median missing rate across quarters in transcripts_df
+quarter_cols_all <- grep("^CQ", colnames(transcripts_df), value = TRUE)
+
+quarter_missing_rate <- colMeans(is.na(transcripts_df[, quarter_cols_all])) * 100
+
+cat("Missing rate (%) of each quarter:\n")
+print(quarter_missing_rate)
+
+avg_missing_rate <- mean(quarter_missing_rate)
+median_missing_rate <- median(quarter_missing_rate)
+
+cat(sprintf("\nAverage missing rate across quarters: %.2f%%\n", avg_missing_rate))
+cat(sprintf("Median missing rate across quarters: %.2f%%\n", median_missing_rate))
+```
+
+## 5. CRSP universe alignment and column prep
+
+Drop tickers removed from transcripts, inspect CRSP uniqueness, **drop unused columns**, and parse **`dlycaldt`** as datetimes for time-series operations.
+
+
+```{r cell_remove_from_crsp}
+# 8) Remove from CRSP the same tickers removed from transcripts
+removed_from_transcripts <- c()
+if (exists("missing_symbols")) removed_from_transcripts <- c(removed_from_transcripts, missing_symbols)
+if (exists("top4_missing_tickers")) removed_from_transcripts <- c(removed_from_transcripts, top4_missing_tickers)
+removed_from_transcripts <- sort(unique(removed_from_transcripts))
+cat("Tickers removed from transcripts_df:", paste0("['", paste(removed_from_transcripts, collapse = "', '"), "']"), "\n")
+
+crsp_rows_before <- nrow(crsp_df)
+crsp_tickers_before <- length(unique(crsp_df$ticker))
+
+crsp_df <- crsp_df %>% filter(!ticker %in% removed_from_transcripts)
+
+cat("CRSP rows before/after:", crsp_rows_before, "|", nrow(crsp_df), "\n")
+cat("CRSP unique tickers before/after:", crsp_tickers_before, "|", length(unique(crsp_df$ticker)), "\n")
+```
+
+```{r cell_crsp_head}
+# --- CRSP sample rows after alignment ---
+head(crsp_df)
+```
+
+```{r cell_crsp_nunique}
+# --- CRSP cardinality of key columns ---
+sapply(crsp_df, function(col) length(unique(col)))
+```
+
+```{r cell_crsp_drop_cols}
+# 10) Drop selected identifier/metadata columns from crsp_df
+cols_to_drop <- c(
+  "permno", "permco", "cusip", "issuernm",
+  "securitytype", "sharetype", "usincflg", "shradrflg"
+)
+
+existing_cols_to_drop <- intersect(cols_to_drop, colnames(crsp_df))
+
+crsp_df <- crsp_df %>% select(-all_of(existing_cols_to_drop))
+
+cat("Dropped columns from crsp_df:", paste0("['", paste(existing_cols_to_drop, collapse = "', '"), "']"), "\n")
+cat("New crsp_df shape:", paste(nrow(crsp_df), ncol(crsp_df), sep = ", "), "\n")
+```
+
+```{r cell_crsp_parse_date}
+# Convert dlycaldt to Date dtype
+crsp_df <- crsp_df %>% mutate(dlycaldt = ymd(dlycaldt))
+```
+
+```{r cell_transcripts_shape}
+# --- Transcript panel shape after filtering ---
+dim(transcripts_filtered_df)
+```
+
+## 6. Transcript reshape (ticker × quarter)
+
+Pivot wide transcript data into **one row per (ticker, fiscal quarter)** with the modeling metrics as columns.
+
+
+```{r cell_reshape_transcripts}
+# 11) Reshape transcripts into one row per ticker-quarter with 4 metric columns
+source_transcripts_df <- if (exists("transcripts_filtered_df")) transcripts_filtered_df else transcripts_df
+
+source_transcripts_df <- source_transcripts_df %>%
+  rename(ticker = Symbol) %>%
+  mutate(ticker = str_trim(as.character(ticker)))
+
+metric_col_candidates <- colnames(source_transcripts_df)[tolower(str_trim(colnames(source_transcripts_df))) == "metrics"]
+metric_col <- metric_col_candidates[1]
+colnames(source_transcripts_df)[colnames(source_transcripts_df) == metric_col] <- "metric_name"
+source_transcripts_df$metric_name <- str_trim(as.character(source_transcripts_df$metric_name))
+
+metric_map <- c(
+  "net positivity" = "net_positivity",
+  "language complexity" = "language_complexity",
+  "numeric transeprency" = "numeric_transparency",
+  "numeric transparency" = "numeric_transparency",
+  "analyst selectivity ratio" = "analyst_selectivity_ratio"
+)
+
+source_transcripts_df <- source_transcripts_df %>%
+  mutate(metric_key = str_replace_all(tolower(metric_name), "\\s+", " "),
+         metric_key = unname(metric_map[metric_key]))
+
+quarter_cols <- grep("^CQ", colnames(source_transcripts_df), value = TRUE)
+quarter_cols <- quarter_cols[order(sapply(quarter_cols, function(c) {
+  as.integer(substr(c, 4, nchar(c))) * 10 + as.integer(substr(c, 3, 3))
+}))]
+
+id_cols <- c("ticker", "metric_key")
+
+transcripts_long_df <- source_transcripts_df %>%
+  select(all_of(c(id_cols, quarter_cols))) %>%
+  pivot_longer(cols = all_of(quarter_cols),
+               names_to = "quarter_code",
+               values_to = "metric_value")
+
+quarter_parts <- str_match(transcripts_long_df$quarter_code, "^CQ([1-4])(\\d{4})$")
+transcripts_long_df$quarter_num <- as.integer(quarter_parts[, 2])
+transcripts_long_df$year <- as.integer(quarter_parts[, 3])
+transcripts_long_df <- transcripts_long_df %>%
+  filter(!is.na(quarter_num) & !is.na(year))
+transcripts_long_df$quarter_key <- as.yearqtr(paste0(transcripts_long_df$year, " Q", transcripts_long_df$quarter_num))
+
+transcripts_metric_df <- transcripts_long_df %>%
+  select(ticker, quarter_key, metric_key, metric_value) %>%
+  pivot_wider(names_from = metric_key, values_from = metric_value)
+
+metric_feature_cols <- c(
+  "net_positivity",
+  "language_complexity",
+  "numeric_transparency",
+  "analyst_selectivity_ratio"
+)
+for (col in metric_feature_cols) {
+  if (!col %in% colnames(transcripts_metric_df)) {
+    transcripts_metric_df[[col]] <- NA
+  }
+}
+
+transcripts_metric_df <- transcripts_metric_df %>%
+  select(ticker, quarter_key, all_of(metric_feature_cols))
+
+cat("transcripts_long_df shape:", paste(nrow(transcripts_long_df), ncol(transcripts_long_df), sep = ", "), "\n")
+cat("transcripts_metric_df shape:", paste(nrow(transcripts_metric_df), ncol(transcripts_metric_df), sep = ", "), "\n")
+head(transcripts_metric_df)
+```
+
+```{r cell_transcripts_metric_preview}
+# --- Preview ticker-quarter metric table ---
+head(transcripts_metric_df, 50)
+```
+
+## 7. Daily panel merge and target
+
+Join CRSP daily rows to the **prior completed quarter** transcript metrics, **deduplicate** `(ticker, date)` on CRSP and again after merge, build **`next_day_dlyretx`** (primary modeling target) and **`next_day_return`** (diagnostic, from `dlyret`), audit/drop rare non-last target NaNs, validate metric coverage.
+
+
+```{r cell_build_merged}
+# 12) Build ML panel — merge CRSP daily with prior-quarter transcript metrics
+crsp_merge_df <- crsp_df %>%
+  mutate(ticker = str_trim(as.character(ticker)),
+         dlycaldt = ymd(dlycaldt)) %>%
+  arrange(ticker, dlycaldt) %>%
+  distinct(ticker, dlycaldt, .keep_all = TRUE)
+
+# Derive quarter keys: current quarter and the prior completed quarter (avoids look-ahead bias)
+crsp_merge_df <- crsp_merge_df %>%
+  mutate(current_quarter_key = as.yearqtr(dlycaldt),
+         prior_quarter_key = current_quarter_key - 0.25)
+
+metric_feature_cols <- c(
+  "net_positivity",
+  "language_complexity",
+  "numeric_transparency",
+  "analyst_selectivity_ratio"
+)
+
+transcript_join_df <- transcripts_metric_df %>%
+  rename(prior_quarter_key = quarter_key) %>%
+  mutate(ticker = str_trim(as.character(ticker)))
+
+merged_daily_df <- crsp_merge_df %>%
+  left_join(transcript_join_df, by = c("ticker", "prior_quarter_key"))
+
+# Transcript metrics arrive as strings from pivot; cast to numeric for modeling
+for (col in metric_feature_cols) {
+  merged_daily_df[[col]] <- suppressWarnings(as.numeric(merged_daily_df[[col]]))
+}
+
+rows_pre_md <- nrow(merged_daily_df)
+merged_daily_df <- merged_daily_df %>%
+  arrange(ticker, dlycaldt) %>%
+  distinct(ticker, dlycaldt, .keep_all = TRUE)
+cat("Post-merge dedup removed", rows_pre_md - nrow(merged_daily_df), "duplicate (ticker, dlycaldt) rows\n")
+
+cat("crsp_merge_df shape :", paste(nrow(crsp_merge_df), ncol(crsp_merge_df), sep = ", "), "\n")
+cat("merged_daily_df shape:", paste(nrow(merged_daily_df), ncol(merged_daily_df), sep = ", "), "\n")
+head(merged_daily_df)
+```
+
+```{r cell_merged_info}
+# --- Merged daily panel: dtypes and non-null counts ---
+glimpse(merged_daily_df)
+cat("\nNon-null counts:\n")
+print(colSums(!is.na(merged_daily_df)))
+```
+
+```{r cell_next_day_return}
+# 13) Primary model target: next_day_dlyretx (next row dlyretx). next_day_return is diagnostic (next row dlyret).
+merged_daily_df <- merged_daily_df %>%
+  arrange(ticker, dlycaldt) %>%
+  group_by(ticker) %>%
+  mutate(
+    next_day_return = dplyr::lead(dlyret),
+    next_day_dlyretx = dplyr::lead(dlyretx)
+  ) %>%
+  ungroup()
+
+cat("next_day_return null count:", sum(is.na(merged_daily_df$next_day_return)), "\n")
+cat("next_day_dlyretx null count:", sum(is.na(merged_daily_df$next_day_dlyretx)), "\n")
+cat("Unique tickers (expect same NaN count for last-day rows):", length(unique(merged_daily_df$ticker)), "\n")
+head(
+  merged_daily_df %>%
+    select(ticker, dlycaldt, dlyret, dlyretx, next_day_return, next_day_dlyretx),
+  10
+)
+```
+
+```{r cell_validation_checks}
+# --- Data quality checks on merged panel (metrics vs returns) ---
+# 14) Validation checks
+metric_feature_cols <- c(
+  "net_positivity",
+  "language_complexity",
+  "numeric_transparency",
+  "analyst_selectivity_ratio"
+)
+
+# 1. Row preservation
+crsp_row_count <- nrow(crsp_merge_df)
+merged_row_count <- nrow(merged_daily_df)
+cat(sprintf("Row preservation — CRSP: %s  |  Merged: %s\n",
+            format(crsp_row_count, big.mark = ","),
+            format(merged_row_count, big.mark = ",")))
+stopifnot(crsp_row_count == merged_row_count)
+
+# 2. Key uniqueness / duplicate-inflation check
+crsp_dup_keys <- sum(duplicated(crsp_merge_df[, c("ticker", "dlycaldt")]))
+dup_keys <- sum(duplicated(merged_daily_df[, c("ticker", "dlycaldt")]))
+cat(sprintf("Duplicate (ticker, dlycaldt) in CRSP source : %d\n", crsp_dup_keys))
+cat(sprintf("Duplicate (ticker, dlycaldt) after merge  : %d\n", dup_keys))
+
+stopifnot(dup_keys == crsp_dup_keys)
+
+# 3. Metric missingness after merge
+missing_rates <- round(colMeans(is.na(merged_daily_df[, metric_feature_cols])) * 100, 2)
+cat("\nMetric missing rate (%) after merge:\n")
+print(missing_rates)
+
+# 4–4b) next_day_return / next_day_dlyretx NaN audit — should only be NaN at last trading day per ticker
+
+audit_one_target <- function(df, tgt_col, px_col) {
+  n_t <- length(unique(df$ticker))
+  last_day_per_ticker <- df %>%
+    arrange(ticker, dlycaldt) %>%
+    group_by(ticker) %>%
+    summarise(dlycaldt = last(dlycaldt), .groups = "drop")
+  last_day_join <- last_day_per_ticker %>%
+    inner_join(df %>% select(ticker, dlycaldt, all_of(tgt_col)),
+               by = c("ticker", "dlycaldt"))
+  last_day_nulls <- sum(is.na(last_day_join[[tgt_col]]))
+  non_last_nulls <- sum(is.na(df[[tgt_col]])) - last_day_nulls
+  cat(sprintf("\n%s NaN at last date per ticker: %d / %d\n", tgt_col, last_day_nulls, n_t))
+  cat(sprintf("%s NaN at non-last dates (unexpected): %d\n", tgt_col, non_last_nulls))
+
+  evt <- df %>%
+    arrange(ticker, dlycaldt) %>%
+    group_by(ticker) %>%
+    mutate(
+      is_last_trade = dlycaldt == max(dlycaldt),
+      px_lead = dplyr::lead(.data[[px_col]]),
+      dlycaldt_lead = dplyr::lead(dlycaldt)
+    ) %>%
+    ungroup()
+
+  anom <- evt %>% filter(is.na(.data[[tgt_col]]), !is_last_trade)
+  cat(sprintf("\n=== %s anomaly audit (non-last NaN) ===\n", tgt_col))
+  cat("Anomaly row count:", nrow(anom), "\n")
+  if (nrow(anom) > 0) {
+    show_cols <- c("ticker", "dlycaldt", px_col, "px_lead", tgt_col, "dlycaldt_lead")
+    print(anom %>% select(any_of(show_cols)))
+    cat("Interpretation: ", tgt_col, " should match ", px_col, " on next trade date; NaN usually means missing ",
+        px_col, " on next trade date.\n", sep = "")
+  }
+  anom %>% distinct(ticker, dlycaldt)
+}
+
+drop_keys <- NULL
+drop_keys <- bind_rows(
+  audit_one_target(merged_daily_df, "next_day_return", "dlyret"),
+  audit_one_target(merged_daily_df, "next_day_dlyretx", "dlyretx")
+)
+
+if (!is.null(drop_keys) && nrow(drop_keys) > 0) {
+  cat("\nDropping these rows (reason code TARGET_NEXT_NA).\n")
+  merged_daily_df <- merged_daily_df %>%
+    anti_join(drop_keys, by = c("ticker", "dlycaldt")) %>%
+    arrange(ticker, dlycaldt) %>%
+    group_by(ticker) %>%
+    mutate(
+      next_day_return = dplyr::lead(dlyret),
+      next_day_dlyretx = dplyr::lead(dlyretx)
+    ) %>%
+    ungroup()
+
+  cat("\n--- After drop ---\n")
+  audit_one_target(merged_daily_df, "next_day_return", "dlyret")
+  audit_one_target(merged_daily_df, "next_day_dlyretx", "dlyretx")
+}
+
+# 5. Spot-check: quarter alignment for one ticker
+sample_ticker <- merged_daily_df$ticker[1]
+cat(sprintf("\nSpot-check for %s — date, current_quarter, prior_quarter, net_positivity:\n", sample_ticker))
+print(head(merged_daily_df %>%
+             filter(ticker == sample_ticker) %>%
+             select(dlycaldt, current_quarter_key, prior_quarter_key, net_positivity), 10))
+```
+
+```{r cell_dedup}
+# --- One row per (ticker, trade date) — idempotent (dedup already applied after merge) ---
+merged_daily_df <- merged_daily_df %>%
+  mutate(dlycaldt = ymd(as.character(dlycaldt)))
+
+rows_before <- nrow(merged_daily_df)
+merged_daily_df <- merged_daily_df %>%
+  arrange(ticker, dlycaldt) %>%
+  distinct(ticker, dlycaldt, .keep_all = TRUE)
+rows_after <- nrow(merged_daily_df)
+
+cat("Rows before:", rows_before, "\n")
+cat("Rows after:", rows_after, "\n")
+cat("Removed (expect 0 if upstream dedup succeeded):", rows_before - rows_after, "\n")
+```
+
+```{r cell_describe}
+# --- Merged daily panel: numeric summary ---
+summary(merged_daily_df)
+```
+
+## 8. Feature engineering and time-based split
+
+- **Staged features (`FE_STAGE` 1–5)**: (1) baseline transcript levels + `dlyret` lags/rolls + market OHLCV; (2) add **`dlyretx` lags and rolling mean/std**; (3) add **OHLC microstructure** (overnight gap, intraday return, high–low range, Garman–Klass); (4) add **transcript dynamics** (QoQ deltas, deviation vs trailing 2-quarter mean, days since transcript quarter change); (5) add **cross-sectional ranks/z** by date and **industry-relative `dlyretx`** vs same-day `siccd` median.
+- **Scaling**: **z-score** transcript level + dynamics columns with **train-only** means/SDs (non-finite values imputed at train means before scaling, matching `StandardScaler` behavior).
+- **Governance**: duplicate-key assert and train/val calendar ordering check inside the feature chunk.
+- **Split**: train / validation / test by calendar end dates (unchanged).
+
+**Experimental protocol:** set `FE_STAGE` to `1` … `5` in the chunk below, then re-run the feature-engineering chunk, then the split + model chunks; compare RMSE / MAE / R² / directional accuracy / Spearman IC on the held-out test window. Default `FE_STAGE = 5` is the full pipeline.
+
+```{r run_benchmark_config}
+# Run A / Run B benchmark control
+# A = strict no-transcript predictors
+# B = full transcript pipeline
+RUN_LABELS <- c("A", "B")
+RUN_NAMES <- c(
+  A = "Strict no-transcript",
+  B = "Full transcript"
+)
+```
+
+```{r fe_stage}
+# Optional ablation control: set FE_STAGE to 1..5 before running feature engineering.
+# 1 = baseline, 2 = +dlyretx lag/roll, 3 = +OHLC, 4 = +transcript dynamics, 5 = +cross-section (full).
+FE_STAGE <- 5L
+```
+
+```{r cell_feature_engineering}
+# ── Step 1: Feature engineering (mirrors Final_code.ipynb) ───────────────────
+# Staged ablation: 1=baseline (levels+miss+market+dlyret lags/roll+cal+ids),
+# 2=+dlyretx lag/rolling, 3=+OHLC microstructure, 4=+transcript dynamics, 5=+cross-section (full)
+FE_STAGE <- if (exists("FE_STAGE")) as.integer(FE_STAGE[1]) else 5L
+if (!FE_STAGE %in% 1L:5L) stop("FE_STAGE must be between 1 and 5")
+
+model_df <- merged_daily_df %>%
+  mutate(dlycaldt = ymd(as.character(dlycaldt))) %>%
+  arrange(ticker, dlycaldt)
+
+TRANSCRIPT_FEATS <- c(
+  "net_positivity", "language_complexity",
+  "numeric_transparency", "analyst_selectivity_ratio"
+)
+
+# Raw transcript snapshot (before scaling) for missingness + dynamics source
+tr_raw <- model_df[, TRANSCRIPT_FEATS, drop = FALSE]
+
+# ── Transcript dynamics (quarter-level) ───────────────────────────────────────
+TRANSCRIPT_DYN_FEATS <- character(0)
+if (FE_STAGE >= 4L && "prior_quarter_key" %in% names(model_df)) {
+  dyn_base <- model_df %>%
+    distinct(ticker, prior_quarter_key, .keep_all = TRUE) %>%
+    arrange(ticker, prior_quarter_key)
+
+  for (m in TRANSCRIPT_FEATS) {
+    dyn_base <- dyn_base %>%
+      group_by(ticker) %>%
+      mutate(
+        !!paste0(m, "_dq") := .data[[m]] - dplyr::lag(.data[[m]], 1L),
+        !!paste0(m, "_dev2") := .data[[m]] - (dplyr::lag(.data[[m]], 1L) + dplyr::lag(.data[[m]], 2L)) / 2
+      ) %>%
+      ungroup()
+  }
+  dyn_join_cols <- c(
+    "ticker", "prior_quarter_key",
+    unlist(lapply(TRANSCRIPT_FEATS, function(m) c(paste0(m, "_dq"), paste0(m, "_dev2"))))
+  )
+  dyn_join_cols <- intersect(dyn_join_cols, names(dyn_base))
+  model_df <- model_df %>%
+    left_join(dyn_base %>% select(any_of(dyn_join_cols)), by = c("ticker", "prior_quarter_key"))
+
+  model_df <- model_df %>%
+    arrange(ticker, dlycaldt) %>%
+    group_by(ticker) %>%
+    mutate(
+      q_prev = dplyr::lag(prior_quarter_key, 1L),
+      ep_inc = dplyr::case_when(
+        is.na(q_prev) ~ 1L,
+        prior_quarter_key != q_prev ~ 1L,
+        TRUE ~ 0L
+      ),
+      txn_ep = cumsum(ep_inc)
+    ) %>%
+    group_by(ticker, txn_ep) %>%
+    mutate(days_since_transcript_change = as.integer(dlycaldt - min(dlycaldt))) %>%
+    ungroup() %>%
+    select(-q_prev, -ep_inc, -txn_ep)
+
+  TRANSCRIPT_DYN_FEATS <- c(
+    unlist(lapply(TRANSCRIPT_FEATS, function(m) c(paste0(m, "_dq"), paste0(m, "_dev2")))),
+    "days_since_transcript_change"
+  )
+} else {
+  for (m in TRANSCRIPT_FEATS) {
+    model_df[[paste0(m, "_dq")]] <- NA_real_
+    model_df[[paste0(m, "_dev2")]] <- NA_real_
+  }
+  model_df[["days_since_transcript_change"]] <- NA_real_
+  TRANSCRIPT_DYN_FEATS <- c(
+    unlist(lapply(TRANSCRIPT_FEATS, function(m) c(paste0(m, "_dq"), paste0(m, "_dev2")))),
+    "days_since_transcript_change"
+  )
+}
+
+# ── Lagged dlyret ─────────────────────────────────────────────────────────────
+for (lag_k in c(1L, 2L, 5L, 10L, 20L)) {
+  model_df <- model_df %>%
+    group_by(ticker) %>%
+    mutate(!!paste0("dlyret_lag", lag_k) := dplyr::lag(dlyret, lag_k)) %>%
+    ungroup()
+}
+
+# ── dlyretx lag + rolling (FE_STAGE >= 2) ─────────────────────────────────────
+RETX_LAG_FEATS <- paste0("dlyretx_lag", c(1, 2, 5, 10, 20))
+RETX_ROLL_FEATS <- c(
+  paste0("retx_mean_", c(5, 10, 20)),
+  paste0("retx_std_", c(5, 10, 20))
+)
+if (FE_STAGE >= 2L) {
+  for (lag_k in c(1L, 2L, 5L, 10L, 20L)) {
+    model_df <- model_df %>%
+      group_by(ticker) %>%
+      mutate(!!paste0("dlyretx_lag", lag_k) := dplyr::lag(dlyretx, lag_k)) %>%
+      ungroup()
+  }
+  for (w in c(5L, 10L, 20L)) {
+    model_df <- model_df %>%
+      group_by(ticker) %>%
+      arrange(dlycaldt, .by_group = TRUE) %>%
+      mutate(
+        !!paste0("retx_mean_", w) := slider::slide_dbl(
+          dplyr::lag(dlyretx, 1L), mean,
+          .before = w - 1L, .complete = FALSE, na.rm = TRUE
+        ),
+        !!paste0("retx_std_", w) := slider::slide_dbl(
+          dplyr::lag(dlyretx, 1L), stats::sd,
+          .before = w - 1L, .complete = FALSE, na.rm = TRUE
+        )
+      ) %>%
+      ungroup()
+  }
+} else {
+  for (nm in RETX_LAG_FEATS) model_df[[nm]] <- NA_real_
+  for (nm in RETX_ROLL_FEATS) model_df[[nm]] <- NA_real_
+}
+
+# ── Rolling stats on dlyret / dlyvol (shift by 1; windows 5 and 10) ───────────
+for (window in c(5L, 10L)) {
+  model_df <- model_df %>%
+    group_by(ticker) %>%
+    arrange(dlycaldt, .by_group = TRUE) %>%
+    mutate(
+      !!paste0("ret_mean_", window) := slider::slide_dbl(
+        dplyr::lag(dlyret, 1L), mean,
+        .before = window - 1L, .complete = FALSE, na.rm = TRUE
+      ),
+      !!paste0("ret_std_", window) := slider::slide_dbl(
+        dplyr::lag(dlyret, 1L), stats::sd,
+        .before = window - 1L, .complete = FALSE, na.rm = TRUE
+      ),
+      !!paste0("vol_mean_", window) := slider::slide_dbl(
+        dplyr::lag(dlyvol, 1L), mean,
+        .before = window - 1L, .complete = FALSE, na.rm = TRUE
+      )
+    ) %>%
+    ungroup()
+}
+
+# ── OHLC microstructure ───────────────────────────────────────────────────────
+MICROSTRUCT_FEATS <- c("overnight_gap", "intraday_return", "high_low_range", "gk_vol")
+safe_div <- function(a, b, eps = 1e-12) {
+  b2 <- ifelse(!is.na(b) & abs(b) < eps, sign(b) * eps, b)
+  b2 <- ifelse(!is.na(b2) & b2 == 0, NA_real_, b2)
+  ifelse(is.na(b2), NA_real_, a / b2)
+}
+
+model_df <- model_df %>%
+  group_by(ticker) %>%
+  mutate(dlyclose_lag1 = dplyr::lag(dlyclose, 1L)) %>%
+  ungroup()
+
+if (FE_STAGE >= 3L) {
+  model_df <- model_df %>%
+    mutate(
+      overnight_gap = safe_div(dlyopen, dlyclose_lag1) - 1,
+      intraday_return = safe_div(dlyclose, dlyopen) - 1,
+      high_low_range = safe_div(dlyhigh - dlylow, ifelse(dlyclose == 0, NA_real_, dlyclose)),
+      gk_vol = {
+        lo <- log(safe_div(dlyhigh, dlylow))
+        lc <- log(safe_div(dlyclose, dlyopen))
+        0.5 * (lo^2) - (2 * log(2) - 1) * (lc^2)
+      }
+    )
+} else {
+  for (nm in MICROSTRUCT_FEATS) model_df[[nm]] <- NA_real_
+}
+
+# ── Cross-section + industry residual (FE_STAGE >= 5) ─────────────────────────
+XSEC_FEATS <- character(0)
+if (FE_STAGE >= 5L) {
+  xsec_numeric <- c("dlyretx", "dlyret", "ret_mean_10", "ret_std_10", "vol_mean_10")
+  for (xc in xsec_numeric) {
+    if (!xc %in% names(model_df)) next
+    model_df <- model_df %>%
+      group_by(dlycaldt) %>%
+      mutate(
+        !!paste0(xc, "_cs_rank") := dplyr::percent_rank(.data[[xc]]),
+        !!paste0(xc, "_cs_z") := {
+          v <- .data[[xc]]
+          m <- mean(v, na.rm = TRUE)
+          s <- stats::sd(v, na.rm = TRUE)
+          if (!is.finite(s) || s < 1e-12) rep(NA_real_, dplyr::n()) else (v - m) / s
+        }
+      ) %>%
+      ungroup()
+    XSEC_FEATS <- c(XSEC_FEATS, paste0(xc, "_cs_rank"), paste0(xc, "_cs_z"))
+  }
+  if ("siccd" %in% names(model_df)) {
+    model_df <- model_df %>%
+      group_by(dlycaldt, siccd) %>%
+      mutate(dlyretx_ind_med = stats::median(dlyretx, na.rm = TRUE)) %>%
+      ungroup() %>%
+      mutate(dlyretx_ind_res = dlyretx - dlyretx_ind_med)
+  } else {
+    model_df$dlyretx_ind_med <- NA_real_
+    model_df$dlyretx_ind_res <- NA_real_
+  }
+  XSEC_FEATS <- c(XSEC_FEATS, "dlyretx_ind_med", "dlyretx_ind_res")
+} else {
+  for (xc in c("dlyretx", "dlyret", "ret_mean_10", "ret_std_10", "vol_mean_10")) {
+    model_df[[paste0(xc, "_cs_rank")]] <- NA_real_
+    model_df[[paste0(xc, "_cs_z")]] <- NA_real_
+    XSEC_FEATS <- c(XSEC_FEATS, paste0(xc, "_cs_rank"), paste0(xc, "_cs_z"))
+  }
+  model_df$dlyretx_ind_med <- NA_real_
+  model_df$dlyretx_ind_res <- NA_real_
+  XSEC_FEATS <- c(XSEC_FEATS, "dlyretx_ind_med", "dlyretx_ind_res")
+}
+
+# ── Calendar features (pandas dayofweek: Monday=0) ────────────────────────────
+model_df <- model_df %>%
+  mutate(
+    month = lubridate::month(dlycaldt),
+    dayofweek = (lubridate::wday(dlycaldt, week_start = 1) - 1L) %% 7L
+  )
+
+# ── Label-encode categorical identifiers (R tree APIs) ───────────────────────
+for (col in c("ticker", "siccd", "naics")) {
+  model_df[[paste0(col, "_enc")]] <- as.integer(factor(as.character(model_df[[col]]))) - 1L
+}
+
+# Missingness indicators from raw transcript NA
+for (tf in TRANSCRIPT_FEATS) {
+  model_df[[paste0("miss_", tf)]] <- as.integer(is.na(tr_raw[[tf]]))
+}
+model_df$miss_any_transcript <- as.integer(pmax(
+  model_df$miss_net_positivity,
+  model_df$miss_language_complexity,
+  model_df$miss_numeric_transparency,
+  model_df$miss_analyst_selectivity_ratio
+))
+TRANSCRIPT_MISS_FEATS <- c(paste0("miss_", TRANSCRIPT_FEATS), "miss_any_transcript")
+
+# Train-only scaling on transcript levels + dynamics (when FE_STAGE >= 4)
+TRAIN_END_SCALER <- as.Date("2021-12-31")
+scaler_cols <- if (FE_STAGE >= 4L) {
+  c(TRANSCRIPT_FEATS, intersect(TRANSCRIPT_DYN_FEATS, names(model_df)))
+} else {
+  TRANSCRIPT_FEATS
+}
+
+train_fit_mask <- model_df$dlycaldt <= TRAIN_END_SCALER
+train_sub <- model_df[train_fit_mask, scaler_cols, drop = FALSE]
+train_sub <- train_sub[stats::complete.cases(train_sub), , drop = FALSE]
+if (nrow(train_sub) < 10) {
+  scaler_cols <- TRANSCRIPT_FEATS
+  train_sub <- model_df[train_fit_mask, scaler_cols, drop = FALSE]
+  train_sub <- train_sub[stats::complete.cases(train_sub), , drop = FALSE]
+}
+
+mu_vec <- colMeans(train_sub, na.rm = TRUE)
+sig_vec <- apply(train_sub, 2, stats::sd, na.rm = TRUE)
+sig_vec[!is.finite(sig_vec) | sig_vec == 0] <- 1
+
+for (nm in scaler_cols) {
+  x <- as.numeric(model_df[[nm]])
+  x[!is.finite(x)] <- mu_vec[[nm]]
+  model_df[[nm]] <- (x - mu_vec[[nm]]) / sig_vec[[nm]]
+}
+
+MARKET_FEATS <- c("dlyret", "dlyretx", "dlyvol", "dlycap", "dlyclose", "dlyopen", "dlyhigh", "dlylow")
+LAG_FEATS <- paste0("dlyret_lag", c(1, 2, 5, 10, 20))
+ROLLING_FEATS <- c(
+  paste0("ret_mean_", c(5, 10)),
+  paste0("ret_std_", c(5, 10)),
+  paste0("vol_mean_", c(5, 10))
+)
+CALENDAR_FEATS <- c("month", "dayofweek")
+ID_FEATS <- c("ticker_enc", "siccd_enc", "naics_enc")
+
+FEATURE_COLS <- c(
+  TRANSCRIPT_FEATS, TRANSCRIPT_MISS_FEATS, MARKET_FEATS,
+  LAG_FEATS, ROLLING_FEATS
+)
+if (FE_STAGE >= 2L) FEATURE_COLS <- c(FEATURE_COLS, RETX_LAG_FEATS, RETX_ROLL_FEATS)
+if (FE_STAGE >= 3L) FEATURE_COLS <- c(FEATURE_COLS, MICROSTRUCT_FEATS)
+if (FE_STAGE >= 4L) FEATURE_COLS <- c(FEATURE_COLS, intersect(TRANSCRIPT_DYN_FEATS, names(model_df)))
+if (FE_STAGE >= 5L) FEATURE_COLS <- c(FEATURE_COLS, intersect(XSEC_FEATS, names(model_df)))
+FEATURE_COLS <- c(FEATURE_COLS, CALENDAR_FEATS, ID_FEATS)
+FEATURE_COLS <- intersect(FEATURE_COLS, names(model_df))
+
+# ── Run A / Run B feature sets (strict benchmark) ─────────────────────────────
+FEATURE_COLS_B <- FEATURE_COLS
+dyn_cols_present <- intersect(TRANSCRIPT_DYN_FEATS, names(model_df))
+TRANSCRIPT_EXCLUDE_COLS <- unique(c(
+  TRANSCRIPT_FEATS,
+  TRANSCRIPT_MISS_FEATS,
+  dyn_cols_present
+))
+FEATURE_COLS_A <- setdiff(FEATURE_COLS_B, TRANSCRIPT_EXCLUDE_COLS)
+
+RUN_FEATURE_SETS <- list(
+  A = FEATURE_COLS_A,
+  B = FEATURE_COLS_B
+)
+if (!exists("RUN_LABELS")) RUN_LABELS <- c("A", "B")
+RUN_LABELS <- intersect(RUN_LABELS, names(RUN_FEATURE_SETS))
+if (!length(RUN_LABELS)) stop("No valid RUN_LABELS found in RUN_FEATURE_SETS.")
+
+# Backward-compatible default references use full model
+FEATURE_COLS <- FEATURE_COLS_B
+
+TARGET_COL <- "next_day_dlyretx"
+model_df <- model_df %>% filter(!is.na(.data[[TARGET_COL]]))
+
+stopifnot(!anyDuplicated(model_df[, c("ticker", "dlycaldt")]))
+train_max <- max(model_df$dlycaldt[model_df$dlycaldt <= TRAIN_END_SCALER], na.rm = TRUE)
+val_min <- min(model_df$dlycaldt[model_df$dlycaldt >= as.Date("2022-01-01")], na.rm = TRUE)
+stopifnot(train_max < val_min)
+
+cat(sprintf(
+  "FE_STAGE=%d (1=baseline, 2=+dlyretx lag/roll, 3=+OHLC, 4=+transcript dyn, 5=+xsec/full)\n",
+  FE_STAGE
+))
+cat(sprintf("model_df shape : %s\n", paste(nrow(model_df), ncol(model_df), sep = ", ")))
+cat(sprintf("Features (%d): %s\n", length(FEATURE_COLS),
+            paste0("['", paste(FEATURE_COLS, collapse = "', '"), "']")))
+cat(sprintf("Target         : %s\n", TARGET_COL))
+cat("\nTranscript missingness rate (% of days) — indicator means:\n")
+print(round(colMeans(model_df[, TRANSCRIPT_MISS_FEATS, drop = FALSE]) * 100, 2))
+dyn_cols <- intersect(TRANSCRIPT_DYN_FEATS, names(model_df))
+cat("\nTranscript + dynamics — NaN % after scaling (expect ~0 on scaled cols):\n")
+print(round(colMeans(is.na(model_df[, c(TRANSCRIPT_FEATS, dyn_cols), drop = FALSE])) * 100, 4))
+cat("\nMissing rates (%) per feature:\n")
+print(round(colMeans(is.na(model_df[, FEATURE_COLS, drop = FALSE])) * 100, 2))
+cat("\nRun feature counts:\n")
+for (run_id in RUN_LABELS) {
+  cat(sprintf("  Run %s (%s): %d features\n",
+              run_id,
+              if (exists("RUN_NAMES") && run_id %in% names(RUN_NAMES)) RUN_NAMES[[run_id]] else run_id,
+              length(RUN_FEATURE_SETS[[run_id]])))
+}
+strict_overlap <- intersect(RUN_FEATURE_SETS$A, TRANSCRIPT_EXCLUDE_COLS)
+cat(sprintf("Run A transcript-overlap feature count (expect 0): %d\n", length(strict_overlap)))
+stopifnot(length(strict_overlap) == 0L)
+```
+
+```{r cell_model_df_preview}
+# --- Modeling matrix preview ---
+head(model_df)
+```
+
+```{r cell_time_split}
+# ── Step 2: Time-based train / validation / test split ───────────────────────
+TRAIN_END  <- as.Date("2021-12-31")
+VAL_START  <- as.Date("2022-01-01")
+VAL_END    <- as.Date("2022-12-31")
+TEST_START <- as.Date("2023-01-01")
+
+train_df <- model_df %>% filter(dlycaldt <= TRAIN_END)
+val_df   <- model_df %>% filter(dlycaldt >= VAL_START & dlycaldt <= VAL_END)
+test_df  <- model_df %>% filter(dlycaldt >= TEST_START)
+
+# Sanity checks — no overlap
+stopifnot(max(train_df$dlycaldt) < min(val_df$dlycaldt))
+stopifnot(max(val_df$dlycaldt)   < min(test_df$dlycaldt))
+
+cat(sprintf("Train rows      : %10s  (%s → %s)   (%s)\n",
+            format(nrow(train_df), big.mark = ","),
+            as.character(min(train_df$dlycaldt)),
+            as.character(max(train_df$dlycaldt)),
+            paste(nrow(train_df), ncol(train_df), sep = ", ")))
+cat(sprintf("Validation rows : %10s  (%s → %s)\n",
+            format(nrow(val_df), big.mark = ","),
+            as.character(min(val_df$dlycaldt)),
+            as.character(max(val_df$dlycaldt))))
+cat(sprintf("Test rows       : %10s  (%s → %s)\n",
+            format(nrow(test_df), big.mark = ","),
+            as.character(min(test_df$dlycaldt)),
+            as.character(max(test_df$dlycaldt))))
+
+# Build per-run matrices from the same split boundaries/rows.
+RUN_SPLITS <- list()
+for (run_id in RUN_LABELS) {
+  run_cols <- RUN_FEATURE_SETS[[run_id]]
+  X_train <- train_df[, run_cols, drop = FALSE]
+  y_train <- train_df[[TARGET_COL]]
+  X_val   <- val_df[, run_cols, drop = FALSE]
+  y_val   <- val_df[[TARGET_COL]]
+  X_test  <- test_df[, run_cols, drop = FALSE]
+  y_test  <- test_df[[TARGET_COL]]
+  RUN_SPLITS[[run_id]] <- list(
+    feature_cols = run_cols,
+    X_train = X_train, y_train = y_train,
+    X_val = X_val, y_val = y_val,
+    X_test = X_test, y_test = y_test
+  )
+}
+
+# Row-level comparability guardrail across runs.
+row_counts <- vapply(RUN_SPLITS, function(x) c(
+  train = nrow(x$X_train),
+  val = nrow(x$X_val),
+  test = nrow(x$X_test)
+), numeric(3L))
+stopifnot(length(unique(row_counts["train", ])) == 1L)
+stopifnot(length(unique(row_counts["val", ])) == 1L)
+stopifnot(length(unique(row_counts["test", ])) == 1L)
+
+# Backward-compatible aliases point to Run B (or first available run).
+default_run <- if ("B" %in% names(RUN_SPLITS)) "B" else names(RUN_SPLITS)[1]
+X_train <- RUN_SPLITS[[default_run]]$X_train
+y_train <- RUN_SPLITS[[default_run]]$y_train
+X_val   <- RUN_SPLITS[[default_run]]$X_val
+y_val   <- RUN_SPLITS[[default_run]]$y_val
+X_test  <- RUN_SPLITS[[default_run]]$X_test
+y_test  <- RUN_SPLITS[[default_run]]$y_test
+```
+
+## 9. Model training, tuning, and comparison
+
+**LightGBM** and **XGBoost** baselines, optional Random Forest, shared **evaluation** helpers, **CPU** setup in this R port (the Python notebook probes **GPU** where available), **walk-forward expanding-window time-series CV** on train+validation (by `dlycaldt`), refit best parameters on full train+val, a **comparison table**, and **feature importance** plots.
+
+```{r cell_evaluate_helper}
+# ── Step 3: Evaluation helper ─────────────────────────────────────────────────
+evaluate <- function(y_true, y_pred, label = "") {
+  # Return a list of regression and financial metrics; optionally print them.
+  y_true <- as.numeric(y_true)
+  y_pred <- as.numeric(y_pred)
+
+  ok <- !is.na(y_true) & !is.na(y_pred)
+  yt <- y_true[ok]
+  yp <- y_pred[ok]
+
+  rmse <- sqrt(mean((yt - yp)^2))
+  mae  <- mean(abs(yt - yp))
+  ss_res <- sum((yt - yp)^2)
+  ss_tot <- sum((yt - mean(yt))^2)
+  r2  <- 1 - ss_res / ss_tot
+  dir_acc <- mean(sign(yt) == sign(yp))
+  ic <- suppressWarnings(cor(yt, yp, method = "spearman"))
+
+  result <- list(
+    RMSE = rmse,
+    MAE = mae,
+    R2 = r2,
+    Directional_Accuracy = dir_acc,
+    Spearman_IC = ic
+  )
+  if (nzchar(label)) {
+    cat(sprintf("\n── %s %s\n", label, strrep("─", max(0, 50 - nchar(label)))))
+    for (k in names(result)) {
+      cat(sprintf("  %-25s: %f\n", k, result[[k]]))
+    }
+  }
+  result
+}
+
+# Container filled by model chunks below
+results <- list()
+models_by_run <- list()
+tuning_by_run <- list()
+
+cat("evaluate() helper registered. results dict initialised.\n")
+```
+
+```{r cell_lightgbm_baseline}
+# ── Step 4a: LightGBM ────────────────────────────────────────────────────────
+# Build lgb.Dataset with categorical_feature hint for label-encoded identifiers.
+for (run_id in RUN_LABELS) {
+  split_i <- RUN_SPLITS[[run_id]]
+  X_train_mat <- data.matrix(split_i$X_train)
+  X_val_mat   <- data.matrix(split_i$X_val)
+  X_test_mat  <- data.matrix(split_i$X_test)
+  cat_feats <- intersect(c("ticker_enc", "siccd_enc", "naics_enc"), colnames(split_i$X_train))
+
+  dtrain_lgb <- lgb.Dataset(
+    data = X_train_mat,
+    label = split_i$y_train,
+    categorical_feature = cat_feats
+  )
+  dval_lgb <- lgb.Dataset(
+    data = X_val_mat,
+    label = split_i$y_val,
+    categorical_feature = cat_feats,
+    reference = dtrain_lgb
+  )
+
+  lgb_params <- list(
+    objective = "regression",
+    learning_rate = 0.01,
+    num_leaves = 127,
+    min_data_in_leaf = 50,
+    feature_fraction = 0.8,
+    bagging_fraction = 0.8,
+    max_depth = 6,
+    verbose = -1
+  )
+
+  lgb_model <- lgb.train(
+    params = lgb_params,
+    data = dtrain_lgb,
+    nrounds = 5000,
+    valids = list(valid = dval_lgb),
+    early_stopping_rounds = 100,
+    eval = "l2"
+  )
+
+  lgb_preds <- predict(lgb_model, X_test_mat)
+  key <- paste(run_id, "LightGBM", sep = "::")
+  lbl <- sprintf("Run %s (%s) LightGBM — Test set (2023-2024)",
+                 run_id,
+                 if (exists("RUN_NAMES") && run_id %in% names(RUN_NAMES)) RUN_NAMES[[run_id]] else run_id)
+  results[[key]] <- evaluate(split_i$y_test, lgb_preds, label = lbl)
+
+  if (is.null(models_by_run[[run_id]])) models_by_run[[run_id]] <- list()
+  models_by_run[[run_id]]$lgb_model <- lgb_model
+  models_by_run[[run_id]]$cat_feats <- cat_feats
+  models_by_run[[run_id]]$X_test_mat <- X_test_mat
+
+  cat(sprintf("Run %s LightGBM best iteration: %s\n", run_id, lgb_model$best_iter))
+}
+```
+
+```{r cell_xgboost_baseline}
+# ── Step 4b: XGBoost ─────────────────────────────────────────────────────────
+# CPU-only: cast the three *_enc columns to numeric, build xgb.DMatrix.
+if (!exists("xgb_tree_method")) {
+  xgb_tree_method <- "hist"
+}
+
+for (run_id in RUN_LABELS) {
+  split_i <- RUN_SPLITS[[run_id]]
+  cat_feats <- intersect(c("ticker_enc", "siccd_enc", "naics_enc"), colnames(split_i$X_train))
+
+  X_train_xgb <- split_i$X_train
+  X_val_xgb   <- split_i$X_val
+  X_test_xgb  <- split_i$X_test
+  for (col in cat_feats) {
+    X_train_xgb[[col]] <- as.numeric(X_train_xgb[[col]])
+    X_val_xgb[[col]]   <- as.numeric(X_val_xgb[[col]])
+    X_test_xgb[[col]]  <- as.numeric(X_test_xgb[[col]])
+  }
+
+  dtrain_xgb <- xgb.DMatrix(data = data.matrix(X_train_xgb), label = split_i$y_train)
+  dval_xgb   <- xgb.DMatrix(data = data.matrix(X_val_xgb),   label = split_i$y_val)
+  dtest_xgb  <- xgb.DMatrix(data = data.matrix(X_test_xgb),  label = split_i$y_test)
+
+  xgb_params <- list(
+    objective = "reg:squarederror",
+    tree_method = xgb_tree_method,  # set in GPU stub below to "hist"
+    eta = 0.01,
+    max_depth = 6,
+    subsample = 0.8,
+    colsample_bytree = 0.8
+  )
+
+  xgb_model <- xgb.train(
+    params = xgb_params,
+    data = dtrain_xgb,
+    nrounds = 20000,
+    watchlist = list(val = dval_xgb),
+    early_stopping_rounds = 100,
+    verbose = 0
+  )
+
+  xgb_preds <- predict(xgb_model, dtest_xgb)
+  key <- paste(run_id, "XGBoost", sep = "::")
+  lbl <- sprintf("Run %s (%s) XGBoost — Test set (2023-2024)",
+                 run_id,
+                 if (exists("RUN_NAMES") && run_id %in% names(RUN_NAMES)) RUN_NAMES[[run_id]] else run_id)
+  results[[key]] <- evaluate(split_i$y_test, xgb_preds, label = lbl)
+
+  if (is.null(models_by_run[[run_id]])) models_by_run[[run_id]] <- list()
+  models_by_run[[run_id]]$xgb_model <- xgb_model
+  models_by_run[[run_id]]$X_train_xgb <- X_train_xgb
+  models_by_run[[run_id]]$X_val_xgb <- X_val_xgb
+  models_by_run[[run_id]]$X_test_xgb <- X_test_xgb
+  models_by_run[[run_id]]$dtest_xgb <- dtest_xgb
+
+  cat(sprintf("Run %s XGBoost best iteration: %s\n", run_id, xgb_model$best_iteration))
+}
+```
+
+
+```{r cell_tuning_setup}
+# ── Tuning Setup: walk-forward time-series CV (mirrors Final_code.ipynb) ───────
+# Expanding-window folds on `dlycaldt` over train+val only (pre-test).
+
+TS_CV_N_FOLDS <- 4L
+TS_CV_MIN_TRAIN_ROWS <- 5000L
+
+array_split_vec <- function(x, k) {
+  n <- length(x)
+  if (k <= 0L) return(list())
+  base <- n %/% k
+  rem <- n %% k
+  sizes <- rep(base, k)
+  if (rem > 0L) sizes[seq_len(rem)] <- sizes[seq_len(rem)] + 1L
+  starts <- c(1L, cumsum(utils::head(sizes, -1L)) + 1L)
+  ends <- cumsum(sizes)
+  lapply(seq_len(k), function(i) x[starts[i]:ends[i]])
+}
+
+make_expanding_date_folds <- function(d_trval, n_folds = TS_CV_N_FOLDS,
+                                       min_train_rows = TS_CV_MIN_TRAIN_ROWS) {
+  d <- as.Date(d_trval)
+  u <- sort(unique(d))
+  n_u <- length(u)
+  n_folds <- as.integer(min(max(2L, n_folds), max(2L, n_u - 1L)))
+  parts <- array_split_vec(u, n_folds + 1L)
+  folds <- list()
+  for (k in seq_len(n_folds)) {
+    train_dates <- sort(unique(do.call(c, parts[seq_len(k)])))
+    val_dates <- parts[[k + 1L]]
+    if (!length(val_dates)) next
+    tr_idx <- which(d %in% train_dates)
+    va_idx <- which(d %in% val_dates)
+    if (length(tr_idx) < min_train_rows || length(va_idx) == 0L) next
+    stopifnot(max(d[tr_idx]) < min(d[va_idx]))
+    folds[[length(folds) + 1L]] <- list(train = tr_idx, val = va_idx)
+  }
+  folds
+}
+
+summarize_ts_folds <- function(d_trval, folds, name) {
+  d <- as.Date(d_trval)
+  cat(sprintf("\n── %s: time-series folds (expanding by date) %s\n",
+              name, strrep("─", max(0L, 12L))))
+  for (i in seq_along(folds)) {
+    tr <- folds[[i]]$train
+    va <- folds[[i]]$val
+    cat(sprintf(
+      "  Fold %d: train %s rows  (%s → %s)  |  val %s rows  (%s → %s)\n",
+      i,
+      format(length(tr), big.mark = ","),
+      as.character(min(d[tr])),
+      as.character(max(d[tr])),
+      format(length(va), big.mark = ","),
+      as.character(min(d[va])),
+      as.character(max(d[va]))
+    ))
+  }
+}
+
+run_context <- list()
+for (run_id in RUN_LABELS) {
+  split_i <- RUN_SPLITS[[run_id]]
+  trval_df_i <- dplyr::bind_rows(train_df, val_df)
+  d_trval_i <- trval_df_i$dlycaldt
+  X_trval_i <- dplyr::bind_rows(split_i$X_train, split_i$X_val)
+  y_trval_i <- c(split_i$y_train, split_i$y_val)
+  stopifnot(max(as.Date(d_trval_i)) < min(test_df$dlycaldt))
+  run_context[[run_id]] <- list(
+    d_trval = d_trval_i,
+    X_trval = X_trval_i,
+    y_trval = y_trval_i,
+    best_params_lgb = list(),
+    best_params_xgb = list(),
+    best_params_rf = list()
+  )
+  cat(sprintf("Run %s X_trval shape : %s  (train=%s + val=%s)\n",
+              run_id,
+              paste(nrow(X_trval_i), ncol(X_trval_i), sep = ", "),
+              format(nrow(split_i$X_train), big.mark = ","),
+              format(nrow(split_i$X_val),   big.mark = ",")))
+}
+cat("Tuning utilities ready (walk-forward CV by `dlycaldt`) for all runs.\n")
+```
+
+```{r cell_lgb_tuning}
+# ── Tuning Cell B: LightGBM (time-series CV) ─────────────────────────────────
+lgb_param_grid <- expand.grid(
+  num_leaves        = c(63),   # c(63, 127, 255),
+  min_child_samples = c(20),   # c(20, 100),
+  learning_rate     = c(0.05), # c(0.01, 0.05),
+  stringsAsFactors = FALSE
+)
+
+for (run_id in RUN_LABELS) {
+  ctx <- run_context[[run_id]]
+  folds_lgb <- make_expanding_date_folds(ctx$d_trval, TS_CV_N_FOLDS, TS_CV_MIN_TRAIN_ROWS)
+  if (!length(folds_lgb)) stop(sprintf("No valid time-series folds for LightGBM (Run %s).", run_id))
+  summarize_ts_folds(ctx$d_trval, folds_lgb, sprintf("LightGBM Run %s", run_id))
+
+  cat(sprintf("\n── Run %s LightGBM: %d hyperparameter combos × %d folds %s\n",
+              run_id, nrow(lgb_param_grid), length(folds_lgb), strrep("─", 8L)))
+
+  best_mean <- Inf
+  best_row <- NULL
+  cat_feats <- intersect(c("ticker_enc", "siccd_enc", "naics_enc"), colnames(ctx$X_trval))
+  for (j in seq_len(nrow(lgb_param_grid))) {
+    params_i <- as.list(lgb_param_grid[j, , drop = FALSE])
+    fold_rmses <- numeric(length(folds_lgb))
+    for (fi in seq_along(folds_lgb)) {
+      tr <- folds_lgb[[fi]]$train
+      va <- folds_lgb[[fi]]$val
+      dtrain_i <- lgb.Dataset(
+        data = data.matrix(ctx$X_trval[tr, , drop = FALSE]),
+        label = ctx$y_trval[tr],
+        categorical_feature = cat_feats
+      )
+      dval_i <- lgb.Dataset(
+        data = data.matrix(ctx$X_trval[va, , drop = FALSE]),
+        label = ctx$y_trval[va],
+        reference = dtrain_i
+      )
+      params_full <- list(
+        objective = "regression",
+        learning_rate = params_i$learning_rate,
+        num_leaves = params_i$num_leaves,
+        min_data_in_leaf = params_i$min_child_samples,
+        feature_fraction = 0.8,
+        bagging_fraction = 0.8,
+        verbose = -1
+      )
+      model_i <- lgb.train(
+        params = params_full,
+        data = dtrain_i,
+        nrounds = 1500,
+        valids = list(valid = dval_i),
+        early_stopping_rounds = 100,
+        eval = "l2"
+      )
+      preds <- predict(model_i, data.matrix(ctx$X_trval[va, , drop = FALSE]))
+      fold_rmses[fi] <- sqrt(mean((ctx$y_trval[va] - preds)^2))
+    }
+    mean_rmse <- mean(fold_rmses)
+    cat(sprintf("  [Run %s %d/%d] mean_val_RMSE=%f  params=%s\n",
+                run_id, j, nrow(lgb_param_grid), mean_rmse,
+                paste(names(params_i), unlist(params_i), sep = "=", collapse = ", ")))
+    if (mean_rmse < best_mean) {
+      best_mean <- mean_rmse
+      best_row <- params_i
+    }
+  }
+
+  run_context[[run_id]]$best_params_lgb <- best_row
+  if (length(run_context[[run_id]]$best_params_lgb) == 0L) {
+    stop(sprintf("LightGBM tuning did not produce best_params_lgb for Run %s.", run_id))
+  }
+  cat(sprintf("\nRun %s best params (LightGBM): %s\n",
+              run_id,
+              paste(names(run_context[[run_id]]$best_params_lgb),
+                    unlist(run_context[[run_id]]$best_params_lgb),
+                    sep = "=", collapse = ", ")))
+  cat(sprintf("Run %s best mean CV RMSE (across folds): %f\n", run_id, best_mean))
+}
+```
+
+```{r cell_xgb_tuning}
+# ── Tuning Cell C: XGBoost (time-series CV) ──────────────────────────────────
+xgb_param_grid <- expand.grid(
+  max_depth        = c(4, 6, 8),
+  min_child_weight = c(1, 5),
+  learning_rate    = c(0.01, 0.05),
+  stringsAsFactors = FALSE
+)
+
+for (run_id in RUN_LABELS) {
+  ctx <- run_context[[run_id]]
+  cat_feats <- intersect(c("ticker_enc", "siccd_enc", "naics_enc"), colnames(ctx$X_trval))
+
+  X_trval_xgb <- ctx$X_trval
+  for (col in cat_feats) {
+    X_trval_xgb[[col]] <- as.numeric(X_trval_xgb[[col]])
+  }
+
+  folds_xgb <- make_expanding_date_folds(ctx$d_trval, TS_CV_N_FOLDS, TS_CV_MIN_TRAIN_ROWS)
+  if (!length(folds_xgb)) stop(sprintf("No valid time-series folds for XGBoost (Run %s).", run_id))
+  summarize_ts_folds(ctx$d_trval, folds_xgb, sprintf("XGBoost Run %s", run_id))
+
+  cat(sprintf("\n── Run %s XGBoost: %d hyperparameter combos × %d folds %s\n",
+              run_id, nrow(xgb_param_grid), length(folds_xgb), strrep("─", 8L)))
+
+  best_mean_x <- Inf
+  best_row_x <- NULL
+  for (j in seq_len(nrow(xgb_param_grid))) {
+    params_i <- as.list(xgb_param_grid[j, , drop = FALSE])
+    fold_rmses <- numeric(length(folds_xgb))
+    for (fi in seq_along(folds_xgb)) {
+      tr <- folds_xgb[[fi]]$train
+      va <- folds_xgb[[fi]]$val
+      dtrain_i <- xgb.DMatrix(
+        data = data.matrix(X_trval_xgb[tr, , drop = FALSE]),
+        label = ctx$y_trval[tr]
+      )
+      dval_i <- xgb.DMatrix(
+        data = data.matrix(X_trval_xgb[va, , drop = FALSE]),
+        label = ctx$y_trval[va]
+      )
+      params_full <- list(
+        objective = "reg:squarederror",
+        tree_method = xgb_tree_method,
+        eta = params_i$learning_rate,
+        max_depth = params_i$max_depth,
+        min_child_weight = params_i$min_child_weight,
+        subsample = 0.8,
+        colsample_bytree = 0.8
+      )
+      model_i <- xgb.train(
+        params = params_full,
+        data = dtrain_i,
+        nrounds = 15000,
+        watchlist = list(val = dval_i),
+        early_stopping_rounds = 100,
+        verbose = 0
+      )
+      preds <- predict(model_i, dval_i)
+      fold_rmses[fi] <- sqrt(mean((ctx$y_trval[va] - preds)^2))
+    }
+    mean_rmse <- mean(fold_rmses)
+    cat(sprintf("  [Run %s %d/%d] mean_val_RMSE=%f  params=%s\n",
+                run_id, j, nrow(xgb_param_grid), mean_rmse,
+                paste(names(params_i), unlist(params_i), sep = "=", collapse = ", ")))
+    if (mean_rmse < best_mean_x) {
+      best_mean_x <- mean_rmse
+      best_row_x <- params_i
+    }
+  }
+
+  run_context[[run_id]]$best_params_xgb <- best_row_x
+  if (length(run_context[[run_id]]$best_params_xgb) == 0L) {
+    stop(sprintf("XGBoost tuning did not produce best_params_xgb for Run %s.", run_id))
+  }
+  cat(sprintf("\nRun %s best params (XGBoost): %s\n",
+              run_id,
+              paste(names(run_context[[run_id]]$best_params_xgb),
+                    unlist(run_context[[run_id]]$best_params_xgb),
+                    sep = "=", collapse = ", ")))
+  cat(sprintf("Run %s best mean CV RMSE (across folds): %f\n", run_id, best_mean_x))
+}
+```
+
+
+
+```{r cell_refit_and_compare}
+# ── Tuning Cell E: Refit on train+val → evaluate on test ─────────────────────
+for (run_id in RUN_LABELS) {
+  split_i <- RUN_SPLITS[[run_id]]
+  ctx <- run_context[[run_id]]
+  cat_feats <- intersect(c("ticker_enc", "siccd_enc", "naics_enc"), colnames(ctx$X_trval))
+
+  # ── 1. LightGBM tuned refit ─────────────────────────────────────────────────
+  dtrval_lgb <- lgb.Dataset(
+    data = data.matrix(ctx$X_trval),
+    label = ctx$y_trval,
+    categorical_feature = cat_feats
+  )
+  lgb_tuned_params <- list(
+    objective = "regression",
+    learning_rate    = ctx$best_params_lgb$learning_rate,
+    num_leaves       = ctx$best_params_lgb$num_leaves,
+    min_data_in_leaf = ctx$best_params_lgb$min_child_samples,
+    feature_fraction = 0.8,
+    bagging_fraction = 0.8,
+    verbose = -1
+  )
+  lgb_tuned <- lgb.train(
+    params = lgb_tuned_params,
+    data = dtrval_lgb,
+    nrounds = 1500
+  )
+  lgb_tuned_preds <- predict(lgb_tuned, data.matrix(split_i$X_test))
+  results[[paste(run_id, "LightGBM_tuned", sep = "::")]] <- evaluate(
+    split_i$y_test,
+    lgb_tuned_preds,
+    label = sprintf("Run %s (%s) LightGBM tuned — Test set (2023-2024)",
+                    run_id,
+                    if (exists("RUN_NAMES") && run_id %in% names(RUN_NAMES)) RUN_NAMES[[run_id]] else run_id)
+  )
+
+  # ── 2. XGBoost tuned refit ──────────────────────────────────────────────────
+  X_trval_xgb <- ctx$X_trval
+  X_test_xgb <- split_i$X_test
+  for (col in cat_feats) {
+    X_trval_xgb[[col]] <- as.numeric(X_trval_xgb[[col]])
+    X_test_xgb[[col]] <- as.numeric(X_test_xgb[[col]])
+  }
+  dtrval_xgb <- xgb.DMatrix(data = data.matrix(X_trval_xgb), label = ctx$y_trval)
+  dtest_xgb_refit <- xgb.DMatrix(data = data.matrix(X_test_xgb), label = split_i$y_test)
+  xgb_tuned_params <- list(
+    objective = "reg:squarederror",
+    tree_method = xgb_tree_method,
+    eta = ctx$best_params_xgb$learning_rate,
+    max_depth = ctx$best_params_xgb$max_depth,
+    min_child_weight = ctx$best_params_xgb$min_child_weight,
+    subsample = 0.8,
+    colsample_bytree = 0.8
+  )
+  xgb_tuned <- xgb.train(
+    params = xgb_tuned_params,
+    data = dtrval_xgb,
+    nrounds = 1500,
+    verbose = 0
+  )
+  xgb_tuned_preds <- predict(xgb_tuned, dtest_xgb_refit)
+  results[[paste(run_id, "XGBoost_tuned", sep = "::")]] <- evaluate(
+    split_i$y_test,
+    xgb_tuned_preds,
+    label = sprintf("Run %s (%s) XGBoost tuned — Test set (2023-2024)",
+                    run_id,
+                    if (exists("RUN_NAMES") && run_id %in% names(RUN_NAMES)) RUN_NAMES[[run_id]] else run_id)
+  )
+
+  if (is.null(models_by_run[[run_id]])) models_by_run[[run_id]] <- list()
+  models_by_run[[run_id]]$lgb_tuned <- lgb_tuned
+  models_by_run[[run_id]]$xgb_tuned <- xgb_tuned
+}
+# ── Summary comparison ────────────────────────────────────────────────────────
+cat("\n\n══ Model comparison: baseline vs tuned ══\n")
+compare_df <- dplyr::bind_rows(results, .id = "model")
+model_parts <- do.call(rbind, strsplit(compare_df$model, "::", fixed = TRUE))
+compare_df$run <- model_parts[, 1]
+compare_df$model_name <- model_parts[, 2]
+compare_df$run_name <- ifelse(compare_df$run %in% names(RUN_NAMES), RUN_NAMES[compare_df$run], compare_df$run)
+compare_df <- compare_df[, c("run", "run_name", "model_name", "RMSE", "MAE", "R2", "Directional_Accuracy", "Spearman_IC")]
+compare_df <- compare_df[order(compare_df$run, compare_df$model_name), ]
+print(tibble::as_tibble(compare_df))
+
+# Strict incremental comparison: Run B - Run A by model_name
+metric_cols <- c("RMSE", "MAE", "R2", "Directional_Accuracy", "Spearman_IC")
+compare_a <- compare_df[compare_df$run == "A", c("model_name", metric_cols), drop = FALSE]
+compare_b <- compare_df[compare_df$run == "B", c("model_name", metric_cols), drop = FALSE]
+delta_df <- merge(compare_b, compare_a, by = "model_name", suffixes = c("_B", "_A"), all = FALSE)
+for (m in metric_cols) {
+  delta_df[[paste0("Delta_", m, "_B_minus_A")]] <- delta_df[[paste0(m, "_B")]] - delta_df[[paste0(m, "_A")]]
+}
+cat("\n\n══ Incremental effect: Run B - Run A ══\n")
+print(tibble::as_tibble(delta_df))
+```
+
+```{r cell_feature_importance}
+# ── Step 5: Feature importance (gain) — baseline LightGBM / XGBoost ───────────
+plot_importance_bars <- function(importances, feature_names, title, top_n = 20L) {
+  importances <- as.numeric(importances)
+  feature_names <- as.character(feature_names)
+  ord <- order(importances)
+  k <- min(top_n, length(importances))
+  idx <- tail(ord, k)
+  df_imp <- data.frame(
+    feature = feature_names[idx],
+    importance = importances[idx],
+    stringsAsFactors = FALSE
+  )
+  ggplot(df_imp, aes(x = .data$importance, y = reorder(.data$feature, .data$importance))) +
+    geom_col() +
+    labs(title = title, x = "Importance", y = NULL)
+}
+
+for (run_id in RUN_LABELS) {
+  run_name <- if (run_id %in% names(RUN_NAMES)) RUN_NAMES[[run_id]] else run_id
+  if (!is.null(models_by_run[[run_id]]$lgb_model)) {
+    lgb_imp_df <- lightgbm::lgb.importance(models_by_run[[run_id]]$lgb_model)
+    print(plot_importance_bars(
+      lgb_imp_df$Gain, lgb_imp_df$Feature,
+      sprintf("Run %s (%s) LightGBM — Feature importance (gain); target: %s", run_id, run_name, TARGET_COL)
+    ))
+  }
+
+  if (!is.null(models_by_run[[run_id]]$xgb_model)) {
+    xgb_imp_df <- xgboost::xgb.importance(model = models_by_run[[run_id]]$xgb_model)
+    print(plot_importance_bars(
+      xgb_imp_df$Gain, xgb_imp_df$Feature,
+      sprintf("Run %s (%s) XGBoost — Feature importance (total gain); target: %s", run_id, run_name, TARGET_COL)
+    ))
+  }
+}
+
+results_ic <- dplyr::bind_rows(results, .id = "model")
+parts <- do.call(rbind, strsplit(results_ic$model, "::", fixed = TRUE))
+results_ic$run <- parts[, 1]
+results_ic$model_name <- parts[, 2]
+results_ic <- results_ic[, c("run", "model_name", "RMSE", "MAE", "R2", "Directional_Accuracy", "Spearman_IC")]
+results_ic <- results_ic[order(-results_ic$Spearman_IC), ]
+cat("\n══ Best model by Spearman IC (test 2023–2024) ══\n")
+cat(sprintf("Run %s | %s  (IC = %f)\n",
+            results_ic$run[1], results_ic$model_name[1], results_ic$Spearman_IC[1]))
+```

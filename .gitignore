@@ -1,0 +1,6 @@
+.venv/*
+Rmd/*
+catboost_info/*
+Data
+eda_outputs_transcripts
+.vscode
